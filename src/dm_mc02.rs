@@ -1,6 +1,6 @@
-//! DM-MC02 (STM32H723VG) board setup: clocks, CAN1, DR16 input, watchdog and panic handling.
+//! DM-MC02（STM32H723VG）开发板配置：时钟、CAN1、DR16 输入、看门狗和 panic 处理。
 //!
-//! The CPU runs at 520 MHz from the 24 MHz crystal. TIM2 is Embassy's time driver.
+//! CPU 使用 24 MHz 晶振运行在 520 MHz；TIM2 用作 Embassy 时间驱动。
 
 use core::fmt::Write as _;
 use core::num::{NonZeroU8, NonZeroU16};
@@ -34,12 +34,12 @@ pub type Can1 = BufferedCan<'static, 4, 16>;
 static CAN_TX: StaticCell<TxBuf<4>> = StaticCell::new();
 static CAN_RX: StaticCell<RxBuf<16>> = StaticCell::new();
 
-/// CAN bus errors reported to `log_can_error` since startup.
+/// 自启动以来，报告给 `log_can_error` 的 CAN 总线错误次数。
 pub static CAN_ERRORS: AtomicU32 = AtomicU32::new(0);
 
 pub type Watchdog = IndependentWatchdog<'static, embassy_stm32::peripherals::IWDG1>;
 
-/// Nominal; the LSI clock varies with voltage and temperature.
+/// 标称值；LSI 时钟会随电压和温度变化。
 const WATCHDOG_TIMEOUT_US: u32 = 100_000;
 
 bind_interrupts!(struct Irqs {
@@ -49,12 +49,12 @@ bind_interrupts!(struct Irqs {
     FDCAN1_IT1 => can::IT1InterruptHandler<embassy_stm32::peripherals::FDCAN1>;
 });
 
-/// Take the MCU peripherals and return CAN1, the started watchdog and the DR16 receiver.
-/// Call once at startup. Power the board from USB or its normal input: probe power alone
-/// does not power the CAN transceivers.
+/// 获取 MCU 外设，返回 CAN1、已启动的看门狗和 DR16 接收器。
+/// 启动时调用一次。开发板须通过 USB 或正常电源输入供电，
+/// 仅靠调试探针供电无法给 CAN 收发器供电。
 pub fn init() -> (Can1, Watchdog, RemoteRx) {
-    // After a watchdog reset, halt before CAN starts. Clearing the reset flags first lets
-    // the next manual reset run normally.
+    // 看门狗复位后，在启动 CAN 之前停止。先清除复位标志，
+    // 使下一次手动复位能够正常运行。
     let watchdog_reset = pac::RCC.rsr().read().iwdg1rstf();
     pac::RCC.rsr().modify(|w| w.set_rmvf(true));
     if watchdog_reset {
@@ -65,8 +65,8 @@ pub fn init() -> (Can1, Watchdog, RemoteRx) {
         }
     }
 
-    // 24 MHz / 3 * 65 = 520 MHz, the VOS0 limit without the CPU boost option bit.
-    // AHB runs at 260 MHz and every APB at 130 MHz. CAN takes the crystal directly.
+    // 24 MHz / 3 * 65 = 520 MHz，是未启用 CPU 加速选项位时的 VOS0 上限。
+    // AHB 运行在 260 MHz，各 APB 运行在 130 MHz；CAN 直接使用晶振时钟。
     let mut config = embassy_stm32::Config::default();
     config.rcc.hse = Some(Hse {
         freq: Hertz(24_000_000),
@@ -90,11 +90,12 @@ pub fn init() -> (Can1, Watchdog, RemoteRx) {
     config.rcc.mux.fdcansel = Fdcansel::HSE;
     let p = embassy_stm32::init(config);
 
-    // Only the control task feeds this, after each completed tick.
+    // 仅由控制任务在每个周期完成后喂狗。
     let mut watchdog = Watchdog::new(p.IWDG1, WATCHDOG_TIMEOUT_US);
     watchdog.unleash();
 
-    // Classic CAN on PD0 (RX) and PD1 (TX): 24 MHz / (1 + 17 + 6) = 1 Mbit/s, sampled at 75%.
+    // 经典 CAN 使用 PD0（接收）和 PD1（发送）：24 MHz / (1 + 17 + 6) = 1 Mbit/s，
+    // 采样点为 75%。
     let mut can = CanConfigurator::new(p.FDCAN1, p.PD0, p.PD1, Irqs);
     can.set_config(can.config().set_nominal_bit_timing(NominalBitTiming {
         prescaler: NonZeroU16::new(1).unwrap(),
@@ -106,18 +107,18 @@ pub fn init() -> (Can1, Watchdog, RemoteRx) {
         .into_normal_mode()
         .buffered(CAN_TX.init(TxBuf::new()), CAN_RX.init(RxBuf::new()));
 
-    // DBUS on PD2: 100 kbaud, 8E2. The board inverts the signal, so the UART does not.
+    // PD2 上的 DBUS：100 kbaud、8E2。开发板会反相信号，因此 UART 不再反相。
     let mut remote_config = usart::Config::default();
     remote_config.baudrate = 100_000;
     remote_config.parity = Parity::ParityEven;
     remote_config.stop_bits = StopBits::STOP2;
     let remote = UartRx::new(p.UART5, p.PD2, p.DMA1_CH5, Irqs, remote_config).unwrap();
-    // PC15 switches the 5 V rail that powers the receiver.
+    // PC15 控制为接收器供电的 5 V 电源。
     core::mem::forget(Output::new(p.PC15, Level::High, Speed::Low));
     (can, watchdog, remote)
 }
 
-/// Count a CAN bus error, and log the first one and every 1000th after it.
+/// 统计 CAN 总线错误，并记录首次错误以及此后每第 1000 次错误。
 pub fn log_can_error(error: BusError) {
     let count = CAN_ERRORS.fetch_add(1, Ordering::Relaxed) + 1;
     if count == 1 || count % 1000 == 0 {
@@ -125,23 +126,23 @@ pub fn log_can_error(error: BusError) {
     }
 }
 
-/// One valid 18-byte DBUS frame, without remapping or deadzones.
+/// 一帧有效的 18 字节 DBUS 数据，未进行通道重映射或死区处理。
 #[derive(Clone, Copy)]
 pub struct Dr16 {
-    /// Right horizontal, right vertical, left horizontal, left vertical, wheel; -660..=660.
+    /// 右摇杆水平、右摇杆垂直、左摇杆水平、左摇杆垂直、滚轮；范围为 -660..=660。
     pub channels: [i16; 5],
-    /// 1 up, 2 down, 3 middle.
+    /// 1 为上位，2 为下位，3 为中位。
     pub right_switch: u8,
     pub left_switch: u8,
     pub mouse: [i16; 3],
     pub mouse_left: bool,
     pub mouse_right: bool,
-    /// Bits 0..15: W S A D Shift Ctrl Q E R F G Z X C V B.
+    /// 第 0～15 位对应按键：W S A D Shift Ctrl Q E R F G Z X C V B。
     pub keys: u16,
 }
 
 impl Dr16 {
-    /// Returns `None` for partial frames and out-of-range channels or switches.
+    /// 对不完整的帧、超出范围的通道值或拨杆值返回 `None`。
     pub fn parse(bytes: &[u8]) -> Option<Self> {
         let b: &[u8; 18] = bytes.try_into().ok()?;
         let u = |i: usize| u16::from(b[i]);
@@ -174,10 +175,10 @@ impl Dr16 {
     }
 }
 
-/// Split DBUS frames at UART idle and publish only the latest one.
+/// 根据 UART 空闲间隔分割 DBUS 帧，只发布最新的一帧。
 #[embassy_executor::task]
 pub async fn remote_task(mut rx: RemoteRx) {
-    // Twice a frame, so a read that fills the buffer shows a missing idle gap.
+    // 缓冲区为两帧长度；如果读取填满缓冲区，说明缺少空闲间隔。
     let mut bytes = [0; 36];
     loop {
         match rx.read_until_idle(&mut bytes).await {
@@ -190,8 +191,8 @@ pub async fn remote_task(mut rx: RemoteRx) {
     }
 }
 
-/// Program IWDG1 directly, since the control task owns the HAL watchdog. At the nominal
-/// 32 kHz LSI, reload 799 is 100 ms and reload 0 is 125 us.
+/// 由于控制任务持有 HAL 看门狗，这里直接配置 IWDG1。在标称 32 kHz LSI 下，
+/// 重装载值 799 对应 100 ms，重装载值 0 对应 125 us。
 fn configure_panic_watchdog(reload: u16) {
     use pac::iwdg::vals::{Key, Pr};
 
@@ -209,8 +210,8 @@ fn configure_panic_watchdog(reload: u16) {
     wdg.kr().write(|w| w.set_key(Key::RESET));
 }
 
-/// Disable interrupts, give the probe up to 100 ms to read the message, then reset through
-/// the watchdog. The next boot halts in `init` until a manual reset.
+/// 关闭中断，最多等待 100 ms 供探针读取消息，然后通过看门狗复位。
+/// 下次启动时会在 `init` 中停止，直到手动复位。
 #[panic_handler]
 fn panic(info: &PanicInfo<'_>) -> ! {
     static PANICKED: AtomicBool = AtomicBool::new(false);
