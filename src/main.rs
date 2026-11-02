@@ -25,6 +25,7 @@ const CONTROL_DT_S: f32 = 0.001;
 const PREPARE_ANGLE_TOLERANCE_RAD: f32 = 0.01;
 const PREPARE_SPEED_TOLERANCE_RPM: f32 = 1.0;
 const PREPARE_SETTLE_DURATION: Duration = Duration::from_millis(100);
+const PREPARE_SWITCH_DWELL: Duration = Duration::from_millis(1000);
 const MAX_TARGET_RATE_RAD_S: f32 = 1.0;
 const STICK_DEADZONE: f32 = 0.05;
 // 遥控器调试日志的开关和输出间隔。
@@ -118,6 +119,7 @@ pub struct Control {
     pub can_errors: u32,
     previous_right_switch: Option<u8>,
     armed: bool,
+    prepare_switch_since: Option<Instant>,
     yaw_feedback_time: Option<Instant>,
     pitch_feedback_time: Option<Instant>,
     prepare_settled_since: Option<Instant>,
@@ -133,33 +135,33 @@ pub struct Control {
 impl Default for Control {
     fn default() -> Self {
         let speed_pid_yaw = Pid {
-            kp: 100.0,
-            ki: 50.0,
-            kd:5.0,
+            kp: 90.0,
+            ki: 0.0,
+            kd: 0.0,
             maxout: 25000.0,
             integral_limit: 12500.0,
             ..Pid::default()
         };
         let pos_pid_yaw = Pid {
-            kp: 100.0,
-            ki: 50.0,
-            kd: 1.0,
+            kp: 0.0,
+            ki: 0.0,
+            kd: 0.0,
             maxout: 200.0,
             integral_limit: 100.0,
             ..Pid::default()
         };
         let pos_pid_pitch: Pid = Pid {
-            kp: 100.0,
-            ki: 50.0,
-            kd: 1.0,
+            kp: 0.0,
+            ki: 0.0,
+            kd: 0.0,
             maxout: 200.0,
             integral_limit: 100.0,
             ..Pid::default()
         };
         let speed_pid_pitch = Pid {
-            kp: 100.0,
-            ki: 50.0,
-            kd: 1.0,
+            kp: 90.0,
+            ki: 0.0,
+            kd: 0.0,
             maxout: 25000.0,
             integral_limit: 12500.0,
             ..Pid::default()
@@ -190,6 +192,7 @@ impl Default for Control {
             can_errors: 0,
             previous_right_switch: None,
             armed: false,
+            prepare_switch_since: None,
             yaw_feedback_time: None,
             pitch_feedback_time: None,
             prepare_settled_since: None,
@@ -211,6 +214,7 @@ impl Control {
 
     fn wait(&mut self) {
         self.state = State::Waiting;
+        self.prepare_switch_since = None;
         self.disable_all();
     }
 
@@ -266,6 +270,7 @@ impl Control {
     fn recover_from_fault(&mut self) {
         self.fault = None;
         self.state = State::Running;
+        self.prepare_switch_since = None;
         self.yaw.target_angle_rad = self.yaw.motor.angle_rad;
         self.pitch.target_angle_rad = self.pitch.motor.angle_rad;
         self.yaw.target_rpm = 0.0;
@@ -554,6 +559,7 @@ impl Control {
     /// 根据遥控器、反馈和故障情况选择状态。
     // TODO：检测持续堵转和振荡，并记录故障原因。
     pub fn update_mode(&mut self) {
+        let now = Instant::now();
         let right_switch = self.remote.map(|remote| remote.right_switch);
         let left_switch = self.remote.map(|remote| remote.left_switch);
         self.previous_right_switch = right_switch;
@@ -562,6 +568,7 @@ impl Control {
 
         if self.state == State::Error {
             self.armed = false;
+            self.prepare_switch_since = None;
             let sticks_centered = self.remote.is_some_and(|remote| {
                 remote.channels[2].abs() <= (STICK_DEADZONE * 660.0) as i16
                     && remote.channels[3].abs() <= (STICK_DEADZONE * 660.0) as i16
@@ -580,14 +587,19 @@ impl Control {
             Some(2) => {
                 self.state = State::Waiting;
                 self.armed = true;
+                self.prepare_switch_since = None;
             }
             Some(3) => {
-                let enable_requested = self.armed;
-                self.armed = false;
-                if enable_requested {
-                    self.state = State::Prepare;
+                if self.state == State::Waiting && self.armed {
+                    let since = *self.prepare_switch_since.get_or_insert(now);
+                    if now.saturating_duration_since(since) >= PREPARE_SWITCH_DWELL {
+                        self.state = State::Prepare;
+                        self.armed = false;
+                        self.prepare_switch_since = None;
+                    }
                 } else if self.state == State::Normal {
                     self.state = State::Waiting;
+                    self.prepare_switch_since = None;
                 }
             }
             //（prepare切running逻辑是在update_prepare_mode中处理的）
@@ -595,6 +607,7 @@ impl Control {
             Some(1) => {
                 let normal_requested = self.armed;
                 self.armed = false;
+                self.prepare_switch_since = None;
                 match self.state {
                     State::Waiting if normal_requested => self.state = State::Normal,
                     State::Prepare | State::Running => self.state = State::Waiting,
@@ -604,6 +617,7 @@ impl Control {
             }
             _ => {
                 self.armed = false;
+                self.prepare_switch_since = None;
                 self.state = State::Waiting;
             }
         }
