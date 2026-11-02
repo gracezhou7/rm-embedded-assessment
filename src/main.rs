@@ -3,11 +3,15 @@
 #![forbid(unsafe_code)]
 
 mod dm_mc02;
+mod fault;
+mod pid;
 
 use dm_mc02::Can1;
 use embassy_executor::Spawner;
 use embassy_stm32::can::Frame;
 use embassy_time::{Duration, Instant, Ticker};
+use fault::{AxisFaultMonitor, Fault, OSCILLATION_DETECTION_DURATION};
+use pid::{Pid, PidError};
 
 // GM6020 电压模式组指令，适用于电机 ID 1～4。
 const MOTOR_COMMAND_ID: u16 = 0x1FF;
@@ -30,10 +34,8 @@ const REMOTE_DEBUG_INTERVAL: Duration = Duration::from_millis(500);
 const PREPARE_OUTPUT_ENABLED: bool = false;
 const NORMAL_OUTPUT_ENABLED: bool = true;
 const RUNNING_OUTPUT_ENABLED: bool = false;
-
 // 电压给定值为协议原始数值，不是伏特。
 const MAX_VOLTAGE_COMMAND: f32 = 25000.0;
-
 // 临时阈值，需要结合现场反馈间隔和接收时序确认。
 const NORMAL_FEEDBACK_TIMEOUT: Duration = Duration::from_millis(100);
 
@@ -65,67 +67,6 @@ impl Motor {
         self.angle_rad = angle_raw as f32 / 8192.0 * core::f32::consts::TAU;
         self.speed_rpm = i16::from_be_bytes([data[2], data[3]]) as f32;
         return true;
-    }
-}
-
-/// 单个控制环的 PID 增益、积分和历史数据。
-#[derive(Default)]
-pub struct Pid {
-    pub kp: f32,
-    pub ki: f32,
-    pub kd: f32,
-    pub integral: f32,
-    pub previous_error: Option<f32>,
-    pub maxout: f32,
-    pub integral_limit: f32,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub enum PidError {
-    InvalidInput,
-    InvalidConfiguration,
-    NonFiniteResult,
-}
-
-impl Pid {
-    pub fn reset(&mut self) {
-        self.integral = 0.0;
-        self.previous_error = None;
-    }
-
-    /// `target` 和 `measured` 使用相同单位；`dt_s` 的单位为秒。
-    /// 调用方通过增益确定输出单位。
-    pub fn calculate(&mut self, target: f32, measured: f32, dt_s: f32) -> Result<f32, PidError> {
-        if !target.is_finite() || !measured.is_finite() || !dt_s.is_finite() || dt_s <= 0.0 {
-            return Err(PidError::InvalidInput);
-        }
-        if !self.kp.is_finite()
-            || !self.ki.is_finite()
-            || !self.kd.is_finite()
-            || !self.integral_limit.is_finite()
-            || self.integral_limit < 0.0
-            || !self.maxout.is_finite()
-            || self.maxout < 0.0
-        {
-            return Err(PidError::InvalidConfiguration);
-        }
-        let error = target - measured;
-        let integral = self.integral + error * dt_s;
-        let derivative = match self.previous_error {
-            Some(previous) => (error - previous) / dt_s,
-            None => 0.0,
-        };
-        if !error.is_finite() || !integral.is_finite() || !derivative.is_finite() {
-            return Err(PidError::NonFiniteResult);
-        }
-        let integral = integral.clamp(-self.integral_limit, self.integral_limit);
-        let output = self.kp * error + self.ki * integral + self.kd * derivative;
-        if !output.is_finite() {
-            return Err(PidError::NonFiniteResult);
-        }
-        self.integral = integral;
-        self.previous_error = Some(error);
-        Ok(output.clamp(-self.maxout, self.maxout))
     }
 }
 
@@ -161,17 +102,6 @@ pub struct Axis {
     pub speed_pid: Pid,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Fault {
-    Stalled,
-    Oscillating,
-    InvalidCommand,
-    PrepareTimeout,
-    NormalOverspeed,
-    CanFailure,
-    ControlTiming,
-    InvalidControl,
-}
 /// 各控制周期共用并持续保存的状态。
 pub struct Control {
     pub state: State,
@@ -191,6 +121,9 @@ pub struct Control {
     yaw_feedback_time: Option<Instant>,
     pitch_feedback_time: Option<Instant>,
     prepare_settled_since: Option<Instant>,
+    yaw_fault_monitor: AxisFaultMonitor,
+    pitch_fault_monitor: AxisFaultMonitor,
+    previous_left_switch: Option<u8>,
     last_can_data: [u8; 8],
     last_can_queued: bool,
 }
@@ -260,6 +193,9 @@ impl Default for Control {
             yaw_feedback_time: None,
             pitch_feedback_time: None,
             prepare_settled_since: None,
+            yaw_fault_monitor: AxisFaultMonitor::default(),
+            pitch_fault_monitor: AxisFaultMonitor::default(),
+            previous_left_switch: None,
             last_can_data: [0; 8],
             last_can_queued: false,
         }
@@ -282,6 +218,64 @@ impl Control {
         self.disable_all();
         self.fault = Some(fault);
         self.state = State::Error;
+    }
+
+    fn fail_axis(&mut self, fault: Fault, axis: &'static str) {
+        self.fail(fault);
+        rtt_target::rprintln!("Fault: {:?} detected on {} axis", fault, axis);
+    }
+
+    fn check_motion_faults(&mut self, now: Instant) -> bool {
+        if let Some(fault) = self.yaw_fault_monitor.update(&self.yaw, now) {
+            if fault == Fault::Oscillating {
+                self.fail(fault);
+                rtt_target::rprintln!(
+                    "Fault: {:?} detected on yaw axis at {:.2} Hz for at least {} ms",
+                    fault,
+                    self.yaw_fault_monitor.estimated_frequency_hz,
+                    OSCILLATION_DETECTION_DURATION.as_millis()
+                );
+            } else {
+                self.fail_axis(fault, "yaw");
+            }
+            return true;
+        }
+        if let Some(fault) = self.pitch_fault_monitor.update(&self.pitch, now) {
+            if fault == Fault::Oscillating {
+                self.fail(fault);
+                rtt_target::rprintln!(
+                    "Fault: {:?} detected on pitch axis at {:.2} Hz for at least {} ms",
+                    fault,
+                    self.pitch_fault_monitor.estimated_frequency_hz,
+                    OSCILLATION_DETECTION_DURATION.as_millis()
+                );
+            } else {
+                self.fail_axis(fault, "pitch");
+            }
+            return true;
+        }
+        false
+    }
+
+    fn recover_from_fault(&mut self) {
+        self.fault = None;
+        self.state = State::Running;
+        self.yaw.target_angle_rad = self.yaw.motor.angle_rad;
+        self.pitch.target_angle_rad = self.pitch.motor.angle_rad;
+        self.yaw.target_rpm = 0.0;
+        self.pitch.target_rpm = 0.0;
+        self.yaw.position_pid.reset();
+        self.yaw.speed_pid.reset();
+        self.pitch.position_pid.reset();
+        self.pitch.speed_pid.reset();
+        self.yaw_fault_monitor.reset();
+        self.pitch_fault_monitor.reset();
+        self.prepare_settled_since = None;
+        rtt_target::rprintln!(
+            "Fault recovery: Running at current angles yaw={} rad, pitch={} rad; targets reset",
+            self.yaw.motor.angle_rad,
+            self.pitch.motor.angle_rad
+        );
     }
 
     fn log_invalid_feedback(&mut self) {
@@ -452,7 +446,7 @@ impl Control {
         if !Self::feedback_fresh(self.yaw_feedback_time, now, NORMAL_FEEDBACK_TIMEOUT)
             || !Self::feedback_fresh(self.pitch_feedback_time, now, NORMAL_FEEDBACK_TIMEOUT)
         {
-            self.disable_all();
+            self.wait();
             return;
         }
 
@@ -465,6 +459,8 @@ impl Control {
             self.pitch.speed_pid.reset();
             self.yaw.target_rpm = 0.0;
             self.pitch.target_rpm = 0.0;
+            self.yaw_fault_monitor.reset();
+            self.pitch_fault_monitor.reset();
         }
 
         if let Some(remote) = self.remote {
@@ -487,10 +483,11 @@ impl Control {
         if Self::update_axis_control(&mut self.yaw).is_err()
             || Self::update_axis_control(&mut self.pitch).is_err()
         {
-            self.disable_all();
-            self.fault = Some(Fault::InvalidControl);
-            self.state = State::Error;
+            self.fail(Fault::InvalidControl);
+            rtt_target::rprintln!("Fault: invalid PID calculation in Running");
+            return;
         }
+        self.check_motion_faults(now);
     }
 
     // 回正到两个电机的原始单圈角度零位。
@@ -504,13 +501,15 @@ impl Control {
             self.pitch.speed_pid.reset();
             self.yaw.target_rpm = 0.0;
             self.pitch.target_rpm = 0.0;
+            self.yaw_fault_monitor.reset();
+            self.pitch_fault_monitor.reset();
             self.prepare_settled_since = None;
         }
 
         if !Self::feedback_fresh(self.yaw_feedback_time, now, NORMAL_FEEDBACK_TIMEOUT)
             || !Self::feedback_fresh(self.pitch_feedback_time, now, NORMAL_FEEDBACK_TIMEOUT)
         {
-            self.disable_all();
+            self.wait();
             self.prepare_settled_since = None;
             return;
         }
@@ -518,9 +517,11 @@ impl Control {
         if Self::update_axis_control(&mut self.yaw).is_err()
             || Self::update_axis_control(&mut self.pitch).is_err()
         {
-            self.disable_all();
-            self.fault = Some(Fault::InvalidControl);
-            self.state = State::Error;
+            self.fail(Fault::InvalidControl);
+            rtt_target::rprintln!("Fault: invalid PID calculation in Prepare");
+            return;
+        }
+        if self.check_motion_faults(now) {
             return;
         }
 
@@ -555,8 +556,11 @@ impl Control {
     // TODO：检测持续堵转和振荡，并记录故障原因。
     pub fn update_mode(&mut self) {
         let right_switch = self.remote.map(|remote| remote.right_switch);
+        let left_switch = self.remote.map(|remote| remote.left_switch);
         let previous_switch = self.previous_right_switch;
         self.previous_right_switch = right_switch;
+        let previous_left_switch = self.previous_left_switch;
+        self.previous_left_switch = left_switch;
 
         if self.fault.is_some() {
             self.state = State::Error;
@@ -564,8 +568,17 @@ impl Control {
 
         if self.state == State::Error {
             self.armed = false;
-            // TODO：确认故障条件已解除后，实现明确的人工恢复操作；
-            // 遥控器断联或拨杆位置变化时不得清除 `fault`。
+            let sticks_centered = self.remote.is_some_and(|remote| {
+                remote.channels[2].abs() <= (STICK_DEADZONE * 660.0) as i16
+                    && remote.channels[3].abs() <= (STICK_DEADZONE * 660.0) as i16
+            });
+            if right_switch == Some(3)
+                && left_switch == Some(1)
+                && previous_left_switch == Some(2)
+                && sticks_centered
+            {
+                self.recover_from_fault();
+            }
             return;
         }
 
