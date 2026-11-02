@@ -5,9 +5,8 @@
 use core::fmt::Write as _;
 use core::num::{NonZeroU8, NonZeroU16};
 use core::panic::PanicInfo;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 use embassy_stm32::can::config::NominalBitTiming;
-use embassy_stm32::can::enums::BusError;
 use embassy_stm32::can::{self, BufferedCan, CanConfigurator, RxBuf, TxBuf};
 use embassy_stm32::dma;
 use embassy_stm32::gpio::{Level, Output, Speed};
@@ -33,9 +32,6 @@ pub static REMOTE: Signal<CriticalSectionRawMutex, Option<Dr16>> = Signal::new()
 pub type Can1 = BufferedCan<'static, 4, 16>;
 static CAN_TX: StaticCell<TxBuf<4>> = StaticCell::new();
 static CAN_RX: StaticCell<RxBuf<16>> = StaticCell::new();
-
-/// 自启动以来，报告给 `log_can_error` 的 CAN 总线错误次数。
-pub static CAN_ERRORS: AtomicU32 = AtomicU32::new(0);
 
 pub type Watchdog = IndependentWatchdog<'static, embassy_stm32::peripherals::IWDG1>;
 
@@ -116,14 +112,6 @@ pub fn init() -> (Can1, Watchdog, RemoteRx) {
     // PC15 控制为接收器供电的 5 V 电源。
     core::mem::forget(Output::new(p.PC15, Level::High, Speed::Low));
     (can, watchdog, remote)
-}
-
-/// 统计 CAN 总线错误，并记录首次错误以及此后每第 1000 次错误。
-pub fn log_can_error(error: BusError) {
-    let count = CAN_ERRORS.fetch_add(1, Ordering::Relaxed) + 1;
-    if count == 1 || count % 1000 == 0 {
-        rtt_target::rprintln!("CAN1 bus error {}: {:?}", count, error);
-    }
 }
 
 /// 一帧有效的 18 字节 DBUS 数据，未进行通道重映射或死区处理。

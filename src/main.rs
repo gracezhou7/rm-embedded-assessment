@@ -4,14 +4,13 @@
 
 mod dm_mc02;
 
-use core::sync::atomic::{AtomicU32, Ordering};
 use dm_mc02::Can1;
 use embassy_executor::Spawner;
 use embassy_stm32::can::Frame;
 use embassy_time::{Duration, Instant, Ticker};
 
-// GM6020 电流模式组指令，适用于电机 ID 1～4。
-const MOTOR_COMMAND_ID: u16 = 0x1FE;
+// GM6020 电压模式组指令，适用于电机 ID 1～4。
+const MOTOR_COMMAND_ID: u16 = 0x1FF;
 // yaw 电机为 ID 1，pitch 电机为 ID 2。
 const YAW_FEEDBACK_ID: u16 = 0x205;
 const PITCH_FEEDBACK_ID: u16 = 0x206;
@@ -19,144 +18,41 @@ const PITCH_FEEDBACK_ID: u16 = 0x206;
 const REMOTE_SILENT_TICKS: u16 = 100;
 const TICK: Duration = Duration::from_millis(1);
 const CONTROL_DT_S: f32 = 0.001;
+const PREPARE_ANGLE_TOLERANCE_RAD: f32 = 0.01;
+const PREPARE_SPEED_TOLERANCE_RPM: f32 = 1.0;
+const PREPARE_SETTLE_DURATION: Duration = Duration::from_millis(100);
+const MAX_TARGET_RATE_RAD_S: f32 = 1.0;
+const STICK_DEADZONE: f32 = 0.05;
 // 遥控器调试日志的开关和输出间隔。
 const REMOTE_DEBUG_ENABLED: bool = true;
 const REMOTE_DEBUG_INTERVAL: Duration = Duration::from_millis(500);
-// Normal 状态控制 yaw 电机的速度，pitch 保持零电流。
+//状态使能。
+const PREPARE_OUTPUT_ENABLED: bool = false;
 const NORMAL_OUTPUT_ENABLED: bool = true;
-const NORMAL_SPEED_RPM: f32 = 10.0;
-const NORMAL_CURRENT_A: f32 = 0.1;
-const NORMAL_MAX_SPEED_RPM: f32 = 30.0;
+const RUNNING_OUTPUT_ENABLED: bool = false;
+
+// 电压给定值为协议原始数值，不是伏特。
+const MAX_VOLTAGE_COMMAND: f32 = 25000.0;
+
 // 临时阈值，需要结合现场反馈间隔和接收时序确认。
 const NORMAL_FEEDBACK_TIMEOUT: Duration = Duration::from_millis(100);
 
-/// 占位参数，并非实测安全值；启用回正前必须根据教具重新标定和验证。
-const MOTION_CONFIG: Option<MotionConfig> = Some(MotionConfig {
-    feedback_timeout: Duration::from_millis(100),
-    prepare_timeout: Duration::from_secs(10),
-    settle_time: Duration::from_millis(500),
-    settle_angle_rad: 0.02,
-    settle_speed_rpm: 2.0,
-    stick_deadzone: 0.05,
-    yaw: AxisConfig {
-        min_angle_rad: -0.1,
-        max_angle_rad: 0.1,
-        stick_direction: 1.0,
-        motor_direction: 1.0,
-        max_target_rate_rad_s: 0.1,
-        prepare_target_rate_rad_s: 0.05,
-        max_speed_rpm: 10.0,
-        prepare_speed_rpm: 5.0,
-        max_current_a: 0.1,
-        prepare_current_a: 0.1,
-    },
-    pitch: AxisConfig {
-        min_angle_rad: -0.1,
-        max_angle_rad: 0.1,
-        stick_direction: 1.0,
-        motor_direction: 1.0,
-        max_target_rate_rad_s: 0.1,
-        prepare_target_rate_rad_s: 0.05,
-        max_speed_rpm: 10.0,
-        prepare_speed_rpm: 5.0,
-        max_current_a: 0.1,
-        prepare_current_a: 0.1,
-    },
-});
-/// TODO：只有验证反馈时序、故障检测和控制输出后才能启用正式回正。
-const MOTION_IMPLEMENTED: bool = false;
-
-#[derive(Clone, Copy)]
-struct AxisConfig {
-    min_angle_rad: f32,
-    max_angle_rad: f32,
-    stick_direction: f32,
-    motor_direction: f32,
-    max_target_rate_rad_s: f32,
-    prepare_target_rate_rad_s: f32,
-    max_speed_rpm: f32,
-    prepare_speed_rpm: f32,
-    max_current_a: f32,
-    prepare_current_a: f32,
-}
-
-impl AxisConfig {
-    fn is_valid(self) -> bool {
-        self.min_angle_rad.is_finite()
-            && self.max_angle_rad.is_finite()
-            && self.min_angle_rad < 0.0
-            && self.max_angle_rad > 0.0
-            && (self.stick_direction == -1.0 || self.stick_direction == 1.0)
-            && (self.motor_direction == -1.0 || self.motor_direction == 1.0)
-            && self.max_target_rate_rad_s.is_finite()
-            && self.max_target_rate_rad_s > 0.0
-            && self.prepare_target_rate_rad_s.is_finite()
-            && self.prepare_target_rate_rad_s > 0.0
-            && self.prepare_target_rate_rad_s <= self.max_target_rate_rad_s
-            && self.max_speed_rpm.is_finite()
-            && self.max_speed_rpm > 0.0
-            && self.prepare_speed_rpm.is_finite()
-            && self.prepare_speed_rpm > 0.0
-            && self.prepare_speed_rpm <= self.max_speed_rpm
-            && self.max_current_a.is_finite()
-            && self.max_current_a > 0.0
-            && self.max_current_a <= 3.0
-            && self.prepare_current_a.is_finite()
-            && self.prepare_current_a > 0.0
-            && self.prepare_current_a <= self.max_current_a
-    }
-}
-
-#[derive(Clone, Copy)]
-struct MotionConfig {
-    feedback_timeout: Duration, //电机反馈超时时间
-    prepare_timeout: Duration,
-    settle_time: Duration,
-    settle_angle_rad: f32, //允许回正的角度误差
-    settle_speed_rpm: f32,
-    stick_deadzone: f32, //摇杆输入归一化后，小于这个范围的微小偏移会被当成零处理
-    yaw: AxisConfig, //yaw轴配置，包含这一轴的角度范围、方向、速度、电流限幅登
-    pitch: AxisConfig,
-}
-
-impl MotionConfig {
-    fn is_valid(self) -> bool {
-        self.feedback_timeout > Duration::from_millis(0)
-            && self.prepare_timeout > Duration::from_millis(0)
-            && self.settle_time > Duration::from_millis(0)
-            && self.settle_angle_rad.is_finite()
-            && self.settle_angle_rad > 0.0
-            && self.settle_speed_rpm.is_finite()
-            && self.settle_speed_rpm > 0.0
-            && self.stick_deadzone.is_finite()
-            && (0.0..1.0).contains(&self.stick_deadzone)
-            && self.yaw.is_valid()
-            && self.pitch.is_valid()
-    }
-}
-
-/// 因 CAN 发送队列已满而丢弃的指令帧数，例如没有电机应答时。
-pub static TX_FAILED: AtomicU32 = AtomicU32::new(0);
-
-/// 已配置电机的反馈帧中，长度或角度无效的帧数。
-pub static INVALID_FEEDBACK: AtomicU32 = AtomicU32::new(0);
-
-/// 单个电机的反馈数据和电流指令。
+/// 单个电机的反馈数据和电压指令。
 #[derive(Default)]
 pub struct Motor {
     /// 电机轴单圈角度，单位为 rad；不累计圈数。
     pub angle_rad: f32,
     pub speed_rpm: f32,
-    /// 接收到的反馈电流原始值；电机手册未给出换算成安培的比例。
+    /// 接收到的反馈电流原始值，换算比例尚待确认。
     pub current_raw: i16,
-    /// 电流指令，单位为 A，由 `Control::transmit` 编码。
-    pub command_current_a: f32,
+    /// 电压给定值（协议原始数值），由 `Control::transmit` 编码。
+    pub command_voltage: f32,
 }
 
 impl Motor {
-    /// 清除内存中的电流指令；发送失败时不能保证电机收到零指令。
+    /// 清除内存中的电压指令；发送失败时不能保证电机收到零指令。
     pub fn disable(&mut self) {
-        self.command_current_a = 0.0;
+        self.command_voltage = 0.0;
     }
 
     pub fn read(&mut self, data: &[u8; 8]) -> bool {
@@ -169,13 +65,6 @@ impl Motor {
         self.angle_rad = angle_raw as f32 / 8192.0 * core::f32::consts::TAU;
         self.speed_rpm = i16::from_be_bytes([data[2], data[3]]) as f32;
         return true;
-    }
-}
-
-fn log_invalid_feedback() {
-    let count = INVALID_FEEDBACK.fetch_add(1, Ordering::Relaxed) + 1;
-    if count == 1 || count.is_multiple_of(1000) {
-        rtt_target::rprintln!("Invalid motor feedback: {}", count);
     }
 }
 
@@ -245,11 +134,11 @@ impl Pid {
 pub enum State {
     /// 零输出。等待有效遥控输入和两台电机的新鲜反馈，再等待一次新的使能请求。
     Waiting,
-    /// 限速回正；两轴稳定后进入 `Running`。
+    /// 回正模式，待实现。
     Prepare,
-    /// yaw 以指定目标速度旋转，pitch 保持零电流。
+    /// yaw 以指定目标速度旋转，pitch 保持零电压指令。
     Normal,
-    /// 左摇杆改变各轴的 `target_angle_rad`，双环控制跟踪目标。
+    /// 遥控调试模式，待实现。
     Running,
     /// 保持零输出，直到人工恢复。
     Error,
@@ -268,84 +157,8 @@ pub struct Axis {
     pub target_rpm: f32,
     /// 位置环：输入单位为 rad，输出单位为 rpm。
     pub position_pid: Pid,
-    /// 速度环：输入单位为 rpm，输出单位为 A。
+    /// 速度环：输入单位为 rpm，输出电压给定值的协议原始数值。
     pub speed_pid: Pid,
-}
-
-#[derive(Debug)]
-enum ControlError {
-    InvalidState,
-    InvalidAngle,
-    InvalidTarget,
-    Pid(PidError),
-}
-
-fn apply_deadzone(channel: i16, deadzone: f32) -> f32 {
-    let input = (channel as f32 / 660.0).clamp(-1.0, 1.0);
-    if input.abs() <= deadzone {
-        0.0
-    } else {
-        input.signum() * (input.abs() - deadzone) / (1.0 - deadzone)
-    }
-}
-
-impl Axis {
-    fn update_axis(
-        &mut self,
-        state: State,
-        input: f32,
-        config: AxisConfig,
-    ) -> Result<(), ControlError> {
-        let angle = self.joint_angle_rad.ok_or(ControlError::InvalidAngle)?;
-        if !angle.is_finite()
-            || angle < config.min_angle_rad
-            || angle > config.max_angle_rad
-        {
-            return Err(ControlError::InvalidAngle);
-        }
-        if !self.target_angle_rad.is_finite()
-            || self.target_angle_rad < config.min_angle_rad
-            || self.target_angle_rad > config.max_angle_rad
-        {
-            return Err(ControlError::InvalidTarget);
-        }
-
-        let (speed_limit, current_limit) = match state {
-            State::Prepare => {
-                let step = config.prepare_target_rate_rad_s * CONTROL_DT_S;
-                if self.target_angle_rad.abs() <= step {
-                    self.target_angle_rad = 0.0;
-                } else {
-                    self.target_angle_rad -= self.target_angle_rad.signum() * step;
-                }
-                (config.prepare_speed_rpm, config.prepare_current_a)
-            }
-            State::Running => {
-                let target = self.target_angle_rad
-                    + input * config.stick_direction * config.max_target_rate_rad_s * CONTROL_DT_S;
-                if !target.is_finite() {
-                    return Err(ControlError::InvalidTarget);
-                }
-                self.target_angle_rad = target.clamp(config.min_angle_rad, config.max_angle_rad);
-                (config.max_speed_rpm, config.max_current_a)
-            }
-            _ => return Err(ControlError::InvalidState),
-        };
-
-        // 位置环输出电机转速；方向系数将关节正方向转换为电机正方向。
-        let target_rpm = self
-            .position_pid
-            .calculate(self.target_angle_rad, angle, CONTROL_DT_S)
-            .map_err(ControlError::Pid)?
-            * config.motor_direction;
-        self.target_rpm = target_rpm.clamp(-speed_limit, speed_limit);
-        self.motor.command_current_a = self
-            .speed_pid
-            .calculate(self.target_rpm, self.motor.speed_rpm, CONTROL_DT_S)
-            .map_err(ControlError::Pid)?
-            .clamp(-current_limit, current_limit);
-        Ok(())
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -370,20 +183,48 @@ pub struct Control {
     pub yaw_feedback_age: Option<u16>,
     pub pitch_feedback_age: Option<u16>,
     pub fault: Option<Fault>,
+    pub invalid_feedback: u32,
+    pub tx_failed: u32,
+    pub can_errors: u32,
     previous_right_switch: Option<u8>,
-    normal_armed: bool,
+    armed: bool,
     yaw_feedback_time: Option<Instant>,
     pitch_feedback_time: Option<Instant>,
-    prepare_started: Option<Instant>,
-    settled_since: Option<Instant>,
+    prepare_settled_since: Option<Instant>,
+    last_can_data: [u8; 8],
+    last_can_queued: bool,
 }
 
 /// 初始状态为 `Waiting`，且没有遥控输入。
 // TODO：在实际教具上调试后，配置 PID 增益和安全限幅。
 impl Default for Control {
     fn default() -> Self {
-        let speed_pid = Pid {
-            kp: 10.0,
+        let speed_pid_yaw = Pid {
+            kp: 100.0,
+            ki: 5.0,
+            kd: 1.0,
+            maxout: 100.0,
+            integral_limit: 50.0,
+            ..Pid::default()
+        };
+        let pos_pid_yaw = Pid {
+            kp: 100.0,
+            ki: 5.0,
+            kd: 1.0,
+            maxout: 100.0,
+            integral_limit: 50.0,
+            ..Pid::default()
+        };
+        let pos_pid_pitch: Pid = Pid {
+            kp: 100.0,
+            ki: 5.0,
+            kd: 1.0,
+            maxout: 100.0,
+            integral_limit: 50.0,
+            ..Pid::default()
+        };
+        let speed_pid_pitch = Pid {
+            kp: 100.0,
             ki: 5.0,
             kd: 1.0,
             maxout: 100.0,
@@ -391,30 +232,42 @@ impl Default for Control {
             ..Pid::default()
         };
         let yaw = Axis {
-            speed_pid,
+            speed_pid: speed_pid_yaw,
+            position_pid: pos_pid_yaw,
             ..Axis::default()
         };
+
+        let pitch = Axis {
+            speed_pid: speed_pid_pitch,
+            position_pid: pos_pid_pitch,
+            ..Axis::default()
+        };
+
         Self {
             state: State::Waiting,
             yaw,
-            pitch: Axis::default(),
+            pitch,
             remote: None,
             remote_silent_ticks: REMOTE_SILENT_TICKS,
             yaw_feedback_age: None,
             pitch_feedback_age: None,
             fault: None,
+            invalid_feedback: 0,
+            tx_failed: 0,
+            can_errors: 0,
             previous_right_switch: None,
-            normal_armed: false,
+            armed: false,
             yaw_feedback_time: None,
             pitch_feedback_time: None,
-            prepare_started: None,
-            settled_since: None,
+            prepare_settled_since: None,
+            last_can_data: [0; 8],
+            last_can_queued: false,
         }
     }
 }
 
 impl Control {
-    /// 清除内存中两台电机的电流指令。
+    /// 清除内存中两台电机的电压指令。
     pub fn disable_all(&mut self) {
         self.yaw.motor.disable();
         self.pitch.motor.disable();
@@ -423,8 +276,6 @@ impl Control {
     fn wait(&mut self) {
         self.state = State::Waiting;
         self.disable_all();
-        self.prepare_started = None;
-        self.settled_since = None;
     }
 
     fn fail(&mut self, fault: Fault) {
@@ -433,20 +284,28 @@ impl Control {
         self.state = State::Error;
     }
 
+    fn log_invalid_feedback(&mut self) {
+        self.invalid_feedback = self.invalid_feedback.wrapping_add(1);
+        if self.invalid_feedback == 1 || self.invalid_feedback.is_multiple_of(1000) {
+            rtt_target::rprintln!("Invalid motor feedback: {}", self.invalid_feedback);
+        }
+    }
+
     /// 每 1 ms 运行一次：读取遥控器和电机反馈，更新状态，再计算并发送输出。
     /// 没有遥控输入时强制进入 `Waiting`。
     pub fn tick(&mut self, can: &mut Can1) {
         self.read_remote();
         self.read_feedback(can);
+        let previous_state = self.state;
         self.update_mode();
-        self.update();
+        self.update(previous_state);
         self.transmit(can);
     }
 
     /// 获取遥控任务发布的最新输入。收到无效帧，或连续 `REMOTE_SILENT_TICKS`
     /// 个周期没有输入后，清除遥控数据，由状态更新逻辑清零指令并返回 `Waiting`。
     pub fn read_remote(&mut self) {
-        self.remote_silent_ticks = self.remote_silent_ticks.saturating_add(1);
+        self.remote_silent_ticks = self.remote_silent_ticks.saturating_add(1); //saturating表示超出数据类型能表示的边界时不会绕回去，而是保持在最大值
         if let Some(remote) = dm_mc02::REMOTE.try_take() {
             self.remote = remote;
             if self.remote.is_some() {
@@ -468,12 +327,12 @@ impl Control {
             self.pitch_feedback_age = Some(age.saturating_add(1));
         }
         let receiver = can.reader();
-        while let Ok(received) = receiver.try_receive() {
-            match received {
+        while let Ok(received) = receiver.try_receive() { //try_receive会返回两层的Result，外层是CAN总线是否有帧，内层是帧是否有效，这里判断的是外层是否有帧
+            match received  { //receive是内层的Result，表示帧是否有效，无效帧会返回Err，有效帧会返回Ok，每一种result(state)会包含一个参数
                 Ok(envelope) => {
                     let received_at = envelope.ts;
                     let frame = envelope.frame;
-                    if frame.header().rtr() {
+                    if frame.header().rtr() { //Remote Transmission Request远程帧，表示请求发送数据而不是实际数据帧
                         continue;
                     }
 
@@ -497,7 +356,7 @@ impl Control {
                     let data: &[u8; 8] = match frame.data().try_into() {
                         Ok(data) => data,
                         Err(_) => {
-                            log_invalid_feedback();
+                            self.log_invalid_feedback();
                             continue;
                         }
                     };
@@ -505,73 +364,198 @@ impl Control {
                         *age = Some(0);
                         *time = Some(received_at);
                     } else {
-                        log_invalid_feedback();
+                        self.log_invalid_feedback();
                     }
                 }
                 Err(error) => {
-                    dm_mc02::log_can_error(error);
-                    if self.state == State::Normal {
-                        self.fail(Fault::CanFailure);
+                    self.can_errors = self.can_errors.wrapping_add(1);
+                    if self.can_errors == 1 || self.can_errors.is_multiple_of(1000) {
+                        rtt_target::rprintln!("CAN1 bus error {}: {:?}", self.can_errors, error);
                     }
                 }
             }
         }
     }
 
-    fn feedback_fresh(time: Option<Instant>, now: Instant, timeout: Duration) -> bool {
-        time.is_some_and(|time| now.saturating_duration_since(time) < timeout)
+    fn feedback_fresh(time: Option<Instant>, now: Instant, timeout: Duration) -> bool { //time是上次成功收到电机反馈的时间
+        match time{
+            Some(time) => {
+                let elapsed = now.saturating_duration_since(time);
+                return elapsed < timeout;
+            }
+            None => {
+                return false;
+            }
+        }
     }
 
-    fn update_normal_mode(&mut self, now: Instant, enable_requested: bool) {
-        if self.state != State::Normal && !enable_requested {
-            return;
+    fn update_axis_control(axis: &mut Axis) -> Result<(), PidError> {
+        let mut angle_error = axis.target_angle_rad - axis.motor.angle_rad;
+        if angle_error > core::f32::consts::PI {
+            angle_error -= core::f32::consts::TAU;
+        } else if angle_error < -core::f32::consts::PI {
+            angle_error += core::f32::consts::TAU;
         }
-        if !NORMAL_OUTPUT_ENABLED {
-            if enable_requested {
-                rtt_target::rprintln!("Normal disabled: output switch off");
-            }
+        let measured_angle = axis.target_angle_rad - angle_error;
+        axis.target_rpm =
+            axis.position_pid
+                .calculate(axis.target_angle_rad, measured_angle, CONTROL_DT_S)?;
+        Self::update_speed_control(axis)?;
+        Ok(())
+    }
+
+    fn update_speed_control(axis: &mut Axis) -> Result<(), PidError> {
+        axis.motor.command_voltage = axis.speed_pid.calculate(
+            axis.target_rpm,
+            axis.motor.speed_rpm,
+            CONTROL_DT_S,
+        )?;
+        Ok(())
+    }
+
+    fn apply_stick_deadzone(input: f32) -> f32 {
+        let magnitude = input.abs();
+        if magnitude <= STICK_DEADZONE {
+            0.0
+        } else {
+            input.signum() * (magnitude - STICK_DEADZONE) / (1.0 - STICK_DEADZONE)
+        }
+    }
+
+    fn update_normal_mode(&mut self, now: Instant) {
+        if !Self::feedback_fresh(self.yaw_feedback_time, now, NORMAL_FEEDBACK_TIMEOUT)
+            || !Self::feedback_fresh(self.pitch_feedback_time, now, NORMAL_FEEDBACK_TIMEOUT)
+        {
+            rtt_target::rprintln!("Normal disabled: motor feedback missing or stale");
             self.wait();
             return;
         }
-        if !Self::feedback_fresh(self.yaw_feedback_time, now, NORMAL_FEEDBACK_TIMEOUT) {
-            if enable_requested || self.state == State::Normal {
-                rtt_target::rprintln!("Normal disabled: yaw feedback missing or stale");
-            }
-            self.wait();
-            return;
-        }
-        if self.yaw.motor.speed_rpm.abs() > NORMAL_MAX_SPEED_RPM {
-            self.fail(Fault::NormalOverspeed);
+        if self.yaw.motor.speed_rpm.abs() > 30.0 {
+            //self.fail(Fault::NormalOverspeed);
             rtt_target::rprintln!("Fault: Normal overspeed");
+            self.wait();
             return;
         }
-        if self.state == State::Waiting && enable_requested {
-            self.yaw.speed_pid = Pid {
-                kp: 0.005,
-                ki: 0.0,
-                kd: 0.0,
-                maxout: NORMAL_CURRENT_A,
-                integral_limit: 0.0,
-                ..Pid::default()
-            };
+
+        self.pitch.target_rpm = 30.0;
+        self.yaw.target_rpm = 30.0;
+        if Self::update_speed_control(&mut self.yaw).is_err()
+            || Self::update_speed_control(&mut self.pitch).is_err()
+        {
+            self.fail(Fault::InvalidControl);
+            rtt_target::rprintln!("Normal PID configuration or calculation error");
+        }
+    }
+
+    /// 根据左摇杆积分更新角度目标，再通过位置环和速度环计算输出。
+    pub fn update_running_mode(&mut self, now: Instant, entered: bool) {
+        if !Self::feedback_fresh(self.yaw_feedback_time, now, NORMAL_FEEDBACK_TIMEOUT)
+            || !Self::feedback_fresh(self.pitch_feedback_time, now, NORMAL_FEEDBACK_TIMEOUT)
+        {
+            self.disable_all();
+            return;
+        }
+
+        if entered {
+            self.yaw.target_angle_rad = self.yaw.motor.angle_rad;
+            self.pitch.target_angle_rad = self.pitch.motor.angle_rad;
+            self.yaw.position_pid.reset();
+            self.yaw.speed_pid.reset();
+            self.pitch.position_pid.reset();
+            self.pitch.speed_pid.reset();
             self.yaw.target_rpm = 0.0;
             self.pitch.target_rpm = 0.0;
-            self.state = State::Normal;
-            rtt_target::rprintln!(
-                "Normal started: yaw target {} rpm, limit {} A",
-                NORMAL_SPEED_RPM,
-                NORMAL_CURRENT_A
-            );
+        }
+
+        if let Some(remote) = self.remote {
+            let yaw_input = Self::apply_stick_deadzone(remote.channels[2] as f32 / 660.0);
+            let pitch_input = Self::apply_stick_deadzone(remote.channels[3] as f32 / 660.0);
+            self.yaw.target_angle_rad += yaw_input * MAX_TARGET_RATE_RAD_S * CONTROL_DT_S;
+            if self.yaw.target_angle_rad >= core::f32::consts::TAU {
+                self.yaw.target_angle_rad -= core::f32::consts::TAU;
+            } else if self.yaw.target_angle_rad < 0.0 {
+                self.yaw.target_angle_rad += core::f32::consts::TAU;
+            }
+            self.pitch.target_angle_rad += pitch_input * MAX_TARGET_RATE_RAD_S * CONTROL_DT_S;
+            if self.pitch.target_angle_rad >= core::f32::consts::TAU {
+                self.pitch.target_angle_rad -= core::f32::consts::TAU;
+            } else if self.pitch.target_angle_rad < 0.0 {
+                self.pitch.target_angle_rad += core::f32::consts::TAU;
+            }
+        }
+
+        if Self::update_axis_control(&mut self.yaw).is_err()
+            || Self::update_axis_control(&mut self.pitch).is_err()
+        {
+            self.disable_all();
+            self.fault = Some(Fault::InvalidControl);
+            self.state = State::Error;
+        }
+    }
+
+    // 回正到两个电机的原始单圈角度零位。
+    pub fn update_prepare_mode(&mut self, now: Instant, entered: bool) {
+        if entered {
+            self.yaw.target_angle_rad = 0.0;
+            self.pitch.target_angle_rad = 0.0;
+            self.yaw.position_pid.reset();
+            self.yaw.speed_pid.reset();
+            self.pitch.position_pid.reset();
+            self.pitch.speed_pid.reset();
+            self.yaw.target_rpm = 0.0;
+            self.pitch.target_rpm = 0.0;
+            self.prepare_settled_since = None;
+        }
+
+        if !Self::feedback_fresh(self.yaw_feedback_time, now, NORMAL_FEEDBACK_TIMEOUT)
+            || !Self::feedback_fresh(self.pitch_feedback_time, now, NORMAL_FEEDBACK_TIMEOUT)
+        {
+            self.disable_all();
+            self.prepare_settled_since = None;
+            return;
+        }
+
+        if Self::update_axis_control(&mut self.yaw).is_err()
+            || Self::update_axis_control(&mut self.pitch).is_err()
+        {
+            self.disable_all();
+            self.fault = Some(Fault::InvalidControl);
+            self.state = State::Error;
+            return;
+        }
+
+        let yaw_angle_error = self
+            .yaw
+            .motor
+            .angle_rad
+            .min(core::f32::consts::TAU - self.yaw.motor.angle_rad);
+        let pitch_angle_error = self
+            .pitch
+            .motor
+            .angle_rad
+            .min(core::f32::consts::TAU - self.pitch.motor.angle_rad);
+        let settled = yaw_angle_error <= PREPARE_ANGLE_TOLERANCE_RAD
+            && pitch_angle_error <= PREPARE_ANGLE_TOLERANCE_RAD
+            && self.yaw.motor.speed_rpm.abs() <= PREPARE_SPEED_TOLERANCE_RPM
+            && self.pitch.motor.speed_rpm.abs() <= PREPARE_SPEED_TOLERANCE_RPM;
+
+        if !settled {
+            self.prepare_settled_since = None;
+            return;
+        }
+
+        let settled_since = *self.prepare_settled_since.get_or_insert(now);
+        if now.saturating_duration_since(settled_since) >= PREPARE_SETTLE_DURATION {
+            self.state = State::Running;
+            self.prepare_settled_since = None;
         }
     }
 
     /// 根据遥控器、反馈和故障情况选择状态。
     // TODO：检测持续堵转和振荡，并记录故障原因。
     pub fn update_mode(&mut self) {
-        let now = Instant::now();
         let right_switch = self.remote.map(|remote| remote.right_switch);
         let previous_switch = self.previous_right_switch;
-        let enable_requested = previous_switch == Some(2) && right_switch == Some(3);
         self.previous_right_switch = right_switch;
 
         if self.fault.is_some() {
@@ -579,10 +563,7 @@ impl Control {
         }
 
         if self.state == State::Error {
-            self.normal_armed = false;
-            self.disable_all();
-            self.prepare_started = None;
-            self.settled_since = None;
+            self.armed = false;
             // TODO：确认故障条件已解除后，实现明确的人工恢复操作；
             // 遥控器断联或拨杆位置变化时不得清除 `fault`。
             return;
@@ -590,225 +571,81 @@ impl Control {
 
         match right_switch {
             Some(2) => {
-                self.wait();
-                self.normal_armed = true;
+                self.state = State::Waiting;
+                self.armed = true;
             }
             Some(3) => {
-                if self.state == State::Normal {
-                    self.normal_armed = false;
-                    self.wait();
-                } else {
-                    self.update_recenter_mode(now, enable_requested);
-                    if self.state == State::Running {
-                        self.normal_armed = false;
+                let enable_requested = self.armed;
+                self.armed = false;
+                match self.state {
+                    State::Waiting if enable_requested => {
+                        self.state = State::Prepare;
                     }
+                    State::Normal => self.state = State::Waiting,
+                    State::Waiting | State::Prepare | State::Running => {}
+                    State::Error => {}
                 }
             }
+            //（prepare切running逻辑是在update_prepare_mode中处理的）
+
             Some(1) => {
-                let normal_requested = self.normal_armed
-                    && matches!(self.state, State::Waiting | State::Prepare);
-                self.normal_armed = false;
+                let normal_requested = self.armed && self.state == State::Waiting;
+                self.armed = false;
                 if self.state == State::Waiting && !normal_requested && previous_switch != Some(1) {
                     rtt_target::rprintln!("Normal disabled: move right switch down first");
                 }
-                if normal_requested && self.state == State::Prepare {
-                    self.wait();
-                }
-                if matches!(self.state, State::Waiting | State::Normal) {
-                    self.update_normal_mode(now, normal_requested);
-                } else {
-                    self.wait();
+                match self.state {
+                    State::Waiting if normal_requested => self.state = State::Normal,
+                    State::Prepare | State::Running => self.state = State::Waiting,
+                    State::Waiting | State::Normal => {}
+                    State::Error => {}
                 }
             }
             _ => {
-                self.normal_armed = false;
-                self.wait();
+                self.armed = false;
+                self.state = State::Waiting;
             }
         }
     }
 
-    fn update_recenter_mode(&mut self, now: Instant, enable_requested: bool) {
-        let config = match MOTION_CONFIG {
-            Some(config) if MOTION_IMPLEMENTED && config.is_valid() => config,
-            _ => {
-                if enable_requested {
-                    rtt_target::rprintln!("Motion disabled: configuration or safety checks incomplete");
-                }
-                self.wait();
-                return;
-            }
-        };
-        // 正式回正仍需验证接收时间戳在所有停顿情况下的可靠性。
-        if !Self::feedback_fresh(self.yaw_feedback_time, now, config.feedback_timeout)
-            || !Self::feedback_fresh(self.pitch_feedback_time, now, config.feedback_timeout)
-        {
-            self.wait();
-            return;
-        }
-
-        let angles_valid = self.yaw.joint_angle_rad.is_some_and(f32::is_finite)
-            && self.pitch.joint_angle_rad.is_some_and(f32::is_finite);
-        if !angles_valid {
-            if enable_requested || self.state != State::Waiting {
-                rtt_target::rprintln!("Motion disabled: joint angles not calibrated");
-            }
-            self.wait();
-            return;
-        }
+    /// 根据当前状态设置目标、运行各轴 PID 并写入电压指令。
+    pub fn update(&mut self, previous_state: State) {
+        let now = Instant::now();
 
         match self.state {
-            State::Waiting => {
-                if enable_requested {
-                    let (Some(yaw_angle), Some(pitch_angle)) =
-                        (self.yaw.joint_angle_rad, self.pitch.joint_angle_rad)
-                    else {
-                        self.disable_all();
-                        return;
-                    };
-                    // 两轴目标从当前位置开始，回正时再逐步移动到零位。
-                    self.yaw.target_angle_rad = yaw_angle;
-                    self.pitch.target_angle_rad = pitch_angle;
-                    self.yaw.target_rpm = 0.0;
-                    self.pitch.target_rpm = 0.0;
-                    self.yaw.position_pid.reset();
-                    self.yaw.speed_pid = Pid {
-                        kp: 10.0,
-                        ki: 5.0,
-                        kd: 1.0,
-                        maxout: 100.0,
-                        integral_limit: 50.0,
-                        ..Pid::default()
-                    };
-                    self.pitch.position_pid.reset();
-                    self.pitch.speed_pid.reset();
-                    self.prepare_started = Some(now);
-                    self.settled_since = None;
-                    self.state = State::Prepare;
-                }
-            }
+            State::Normal => self.update_normal_mode(now),
             State::Prepare => {
-                let Some(started) = self.prepare_started else {
-                    self.wait();
-                    return;
-                };
-                if now.saturating_duration_since(started) >= config.prepare_timeout {
-                    self.fail(Fault::PrepareTimeout);
-                    rtt_target::rprintln!("Fault: recentering timed out");
-                    return;
-                }
-                let axis_settled = |axis: &Axis| {
-                    axis.joint_angle_rad.is_some_and(|angle| {
-                        angle.is_finite()
-                            && angle.abs() <= config.settle_angle_rad
-                            && axis.target_angle_rad == 0.0
-                    }) && axis.motor.speed_rpm.is_finite()
-                        && axis.motor.speed_rpm.abs() <= config.settle_speed_rpm
-                };
-                if axis_settled(&self.yaw) && axis_settled(&self.pitch) {
-                    let settled_since = *self.settled_since.get_or_insert(now);
-                    if now.saturating_duration_since(settled_since) >= config.settle_time {
-                        self.state = State::Running;
-                    }
-                } else {
-                    self.settled_since = None;
-                }
+                self.update_prepare_mode(now, previous_state != State::Prepare);
             }
             State::Running => {
-                // TODO：堵转或振荡检测器触发时设置 `fault`。
+                self.update_running_mode(now, previous_state != State::Running);
             }
-            State::Normal => self.wait(),
-            State::Error => {
-                self.disable_all();
-            }
+            State::Waiting | State::Error => self.disable_all(),
         }
     }
 
-    /// 根据当前状态设置目标、运行各轴 PID 并写入电流指令。
-    pub fn update(&mut self) {
-        let switch = self.remote.map(|remote| remote.right_switch);
-        let enabled = match self.state {
-            State::Normal => switch == Some(1),
-            State::Prepare | State::Running => switch == Some(3),
-            _ => false,
-        };
-        if !enabled || self.fault.is_some() {
-            self.disable_all();
-            return;
-        }
-
-        let (yaw_result, pitch_result) = if self.state == State::Normal {
-            self.pitch.target_rpm = 0.0;
-            self.pitch.motor.disable();
-            self.yaw.target_rpm = NORMAL_SPEED_RPM;
-            let yaw_result = self.yaw
-                .speed_pid
-                .calculate(self.yaw.target_rpm, self.yaw.motor.speed_rpm, CONTROL_DT_S)
-                .map(|current| {
-                    self.yaw.motor.command_current_a =
-                        current.clamp(-NORMAL_CURRENT_A, NORMAL_CURRENT_A);
-                })
-                .map_err(ControlError::Pid);
-            (yaw_result, Ok(()))
-        } else {
-            let config = match MOTION_CONFIG {
-                Some(config) if MOTION_IMPLEMENTED && config.is_valid() => config,
-                _ => {
-                    self.disable_all();
-                    self.state = State::Waiting;
-                    rtt_target::rprintln!("Motion disabled: configuration or safety checks incomplete");
-                    return;
-                }
-            };
-            let Some(remote) = self.remote else {
-                self.disable_all();
-                return;
-            };
-            let yaw_input = apply_deadzone(remote.channels[2], config.stick_deadzone);
-            let pitch_input = apply_deadzone(remote.channels[3], config.stick_deadzone);
-            (
-                self.yaw.update_axis(self.state, yaw_input, config.yaw),
-                self.pitch.update_axis(self.state, pitch_input, config.pitch),
-            )
-        };
-
-        if let Err(error) = yaw_result.and(pitch_result) {
-            self.fail(Fault::InvalidControl);
-            match error {
-                ControlError::Pid(error) => {
-                    rtt_target::rprintln!("PID 故障：{:?}", error);
-                }
-                error => {
-                    rtt_target::rprintln!("控制故障：{:?}", error);
-                }
-            }
-        }
-    }
-
-    fn encode_current(current_a: f32) -> Option<[u8; 2]> {
-        if !current_a.is_finite() {
+    fn encode_voltage(voltage: f32) -> Option<[u8; 2]> {
+        if !voltage.is_finite() {
             return None;
         }
-        let limited = current_a.clamp(-3.0, 3.0);
-        let raw = (limited / 3.0 * 16384.0) as i16;
+        let raw = voltage.clamp(-MAX_VOLTAGE_COMMAND, MAX_VOLTAGE_COMMAND) as i16;
         Some(raw.to_be_bytes())
     }
 
     /// 非阻塞地向 CAN1 队列写入组指令。队列满或总线故障时不能保证停止指令送达。
     pub fn transmit(&mut self, can: &mut Can1) {
-        // TODO：启用输出前，确认电机 ID 和电流限幅，并处理队列中的旧指令。
+        // TODO：启用输出前，确认电机 ID 和电压限幅，并处理队列中的旧指令。
         // CAN 发送失败时不能保证电机停止。
-        const OUTPUT_ENABLED: bool = false;
         let mut data = [0u8; 8];
-        // TODO13：按手册限幅、转换各轴的 `command_current_a`，
-        // 并写入电机 ID 对应的字节；其他电机 ID 的字节保持为零。
-        let normal_output = NORMAL_OUTPUT_ENABLED && self.state == State::Normal;
-        if (normal_output || (OUTPUT_ENABLED
-            && matches!(self.state, State::Prepare | State::Running)))
-            && self.fault.is_none()
-        {
-
-            let yaw_bytes = Self::encode_current(self.yaw.motor.command_current_a);
-            let pitch_bytes = Self::encode_current(self.pitch.motor.command_current_a);
+        let output_enabled = match self.state {
+            State::Prepare => PREPARE_OUTPUT_ENABLED,
+            State::Normal => NORMAL_OUTPUT_ENABLED,
+            State::Running => RUNNING_OUTPUT_ENABLED,
+            State::Waiting | State::Error => false,
+        };
+        if output_enabled && self.fault.is_none() {
+            let yaw_bytes = Self::encode_voltage(self.yaw.motor.command_voltage);
+            let pitch_bytes = Self::encode_voltage(self.pitch.motor.command_voltage);
 
             match (yaw_bytes, pitch_bytes){
                 (Some(yaw), Some(pitch)) => {
@@ -816,18 +653,19 @@ impl Control {
                     data[2..4].copy_from_slice(&pitch);
                 }
                 _ => {
-                    self.fail(Fault::InvalidCommand);
+                    //self.fail(Fault::InvalidCommand);
                     rtt_target::rprintln!("Invalid command detected");
                 }
             }
         }
 
         let frame = Frame::new_standard(MOTOR_COMMAND_ID, &data).unwrap();
-        if can.writer().try_write(frame).is_err() {
-            TX_FAILED.fetch_add(1, Ordering::Relaxed);
-            if matches!(self.state, State::Waiting | State::Normal) && self.fault.is_none() {
-                self.fail(Fault::CanFailure);
-                rtt_target::rprintln!("Fault: CAN transmit queue full; disconnect motor power if needed");
+        self.last_can_data = data;
+        self.last_can_queued = can.writer().try_write(frame).is_ok();
+        if !self.last_can_queued {
+            self.tx_failed = self.tx_failed.wrapping_add(1);
+            if self.tx_failed == 1 || self.tx_failed.is_multiple_of(1000) {
+                rtt_target::rprintln!("CAN transmit queue full: {}", self.tx_failed);
             }
         }
     }
@@ -869,22 +707,33 @@ async fn control_task(mut can: Can1, mut watchdog: dm_mc02::Watchdog) {
         control.tick(&mut can);
         watchdog.pet();
         if REMOTE_DEBUG_ENABLED
-            && control.state != State::Normal
             && now.saturating_duration_since(last_remote_debug) >= REMOTE_DEBUG_INTERVAL
         {
             last_remote_debug = now;
             rtt_target::rprintln!(
-                "Status: state={:?}, fault={:?}, yaw_age={:?}, yaw_angle={}, yaw_rpm={}, yaw_target={}, yaw_current={}, tx_failed={}, invalid_feedback={}, can_errors={}",
+                "Status: state={:?}, fault={:?}, yaw_age={:?}, yaw_angle={}, yaw_rpm={}, yaw_target={}, yaw_voltage={}, tx_failed={}, invalid_feedback={}, can_errors={}",
                 control.state,
                 control.fault,
                 control.yaw_feedback_age,
                 control.yaw.motor.angle_rad,
                 control.yaw.motor.speed_rpm,
                 control.yaw.target_rpm,
-                control.yaw.motor.command_current_a,
-                TX_FAILED.load(Ordering::Relaxed),
-                INVALID_FEEDBACK.load(Ordering::Relaxed),
-                dm_mc02::CAN_ERRORS.load(Ordering::Relaxed),
+                control.yaw.motor.command_voltage,
+                control.tx_failed,
+                control.invalid_feedback,
+                control.can_errors,
+            );
+            rtt_target::rprintln!(
+                "Pitch feedback: age={:?}, angle_rad={}, speed_rpm={}",
+                control.pitch_feedback_age,
+                control.pitch.motor.angle_rad,
+                control.pitch.motor.speed_rpm,
+            );
+            rtt_target::rprintln!(
+                "CAN TX attempt: id=0x{:03X}, data={:02X?}, queued={}",
+                MOTOR_COMMAND_ID,
+                control.last_can_data,
+                control.last_can_queued,
             );
             match control.remote {
                 Some(remote) => {
