@@ -2,6 +2,8 @@ use embassy_time::{Duration, Instant};
 
 use crate::Axis;
 
+const STALL_DETECTION_ENABLED: bool = false;
+const OSCILLATION_DETECTION_ENABLED: bool = false;
 const STALL_MIN_TARGET_RPM: f32 = 5.0;
 const STALL_MIN_OUTPUT: f32 = 80.0;
 const STALL_MAX_SPEED_RPM: f32 = 1.0;
@@ -43,8 +45,15 @@ impl AxisFaultMonitor {
         *self = Self::default();
     }
 
-    pub(crate) fn update(&mut self, axis: &Axis, now: Instant) -> Option<Fault> {
-        let stalled = axis.target_rpm.abs() >= STALL_MIN_TARGET_RPM
+    pub(crate) fn update(
+        &mut self,
+        axis: &Axis,
+        now: Instant,
+        output_enabled: bool,
+    ) -> Option<Fault> {
+        let stalled = STALL_DETECTION_ENABLED
+            && output_enabled
+            && axis.target_rpm.abs() >= STALL_MIN_TARGET_RPM
             && axis.motor.command_voltage.abs() >= STALL_MIN_OUTPUT
             && axis.motor.speed_rpm.abs() <= STALL_MAX_SPEED_RPM;
         if stalled {
@@ -54,6 +63,10 @@ impl AxisFaultMonitor {
             }
         } else {
             self.stall_since = None;
+        }
+
+        if !OSCILLATION_DETECTION_ENABLED {
+            return None;
         }
 
         let angle = axis.motor.angle_rad;

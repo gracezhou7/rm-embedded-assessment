@@ -31,9 +31,9 @@ const STICK_DEADZONE: f32 = 0.05;
 const REMOTE_DEBUG_ENABLED: bool = true;
 const REMOTE_DEBUG_INTERVAL: Duration = Duration::from_millis(500);
 //状态使能。
-const PREPARE_OUTPUT_ENABLED: bool = false;
+const PREPARE_OUTPUT_ENABLED: bool = true;
 const NORMAL_OUTPUT_ENABLED: bool = true;
-const RUNNING_OUTPUT_ENABLED: bool = false;
+const RUNNING_OUTPUT_ENABLED: bool = true;
 // 电压给定值为协议原始数值，不是伏特。
 const MAX_VOLTAGE_COMMAND: f32 = 25000.0;
 // 临时阈值，需要结合现场反馈间隔和接收时序确认。
@@ -134,34 +134,34 @@ impl Default for Control {
     fn default() -> Self {
         let speed_pid_yaw = Pid {
             kp: 100.0,
-            ki: 5.0,
-            kd: 1.0,
-            maxout: 100.0,
-            integral_limit: 50.0,
+            ki: 50.0,
+            kd:5.0,
+            maxout: 25000.0,
+            integral_limit: 12500.0,
             ..Pid::default()
         };
         let pos_pid_yaw = Pid {
             kp: 100.0,
-            ki: 5.0,
+            ki: 50.0,
             kd: 1.0,
-            maxout: 100.0,
-            integral_limit: 50.0,
+            maxout: 200.0,
+            integral_limit: 100.0,
             ..Pid::default()
         };
         let pos_pid_pitch: Pid = Pid {
             kp: 100.0,
-            ki: 5.0,
+            ki: 50.0,
             kd: 1.0,
-            maxout: 100.0,
-            integral_limit: 50.0,
+            maxout: 200.0,
+            integral_limit: 100.0,
             ..Pid::default()
         };
         let speed_pid_pitch = Pid {
             kp: 100.0,
-            ki: 5.0,
+            ki: 50.0,
             kd: 1.0,
-            maxout: 100.0,
-            integral_limit: 50.0,
+            maxout: 25000.0,
+            integral_limit: 12500.0,
             ..Pid::default()
         };
         let yaw = Axis {
@@ -225,8 +225,11 @@ impl Control {
         rtt_target::rprintln!("Fault: {:?} detected on {} axis", fault, axis);
     }
 
-    fn check_motion_faults(&mut self, now: Instant) -> bool {
-        if let Some(fault) = self.yaw_fault_monitor.update(&self.yaw, now) {
+    fn check_motion_faults(&mut self, now: Instant, output_enabled: bool) -> bool {
+        if let Some(fault) = self
+            .yaw_fault_monitor
+            .update(&self.yaw, now, output_enabled)
+        {
             if fault == Fault::Oscillating {
                 self.fail(fault);
                 rtt_target::rprintln!(
@@ -240,7 +243,10 @@ impl Control {
             }
             return true;
         }
-        if let Some(fault) = self.pitch_fault_monitor.update(&self.pitch, now) {
+        if let Some(fault) = self
+            .pitch_fault_monitor
+            .update(&self.pitch, now, output_enabled)
+        {
             if fault == Fault::Oscillating {
                 self.fail(fault);
                 rtt_target::rprintln!(
@@ -371,7 +377,7 @@ impl Control {
         }
     }
 
-    fn feedback_fresh(time: Option<Instant>, now: Instant, timeout: Duration) -> bool { //time是上次成功收到电机反馈的时间
+    fn feedback_fresh(time: Option<Instant>, now: Instant, timeout: Duration) -> bool {
         match time{
             Some(time) => {
                 let elapsed = now.saturating_duration_since(time);
@@ -416,17 +422,18 @@ impl Control {
         }
     }
 
-    fn update_normal_mode(&mut self, now: Instant) {
+    fn update_normal_mode(&mut self, now: Instant, entered: bool) {
+        if entered {
+            self.yaw.speed_pid.reset();
+            self.pitch.speed_pid.reset();
+            self.yaw_fault_monitor.reset();
+            self.pitch_fault_monitor.reset();
+        }
+
         if !Self::feedback_fresh(self.yaw_feedback_time, now, NORMAL_FEEDBACK_TIMEOUT)
             || !Self::feedback_fresh(self.pitch_feedback_time, now, NORMAL_FEEDBACK_TIMEOUT)
         {
             rtt_target::rprintln!("Normal disabled: motor feedback missing or stale");
-            self.wait();
-            return;
-        }
-        if self.yaw.motor.speed_rpm.abs() > 30.0 {
-            //self.fail(Fault::NormalOverspeed);
-            rtt_target::rprintln!("Fault: Normal overspeed");
             self.wait();
             return;
         }
@@ -487,7 +494,7 @@ impl Control {
             rtt_target::rprintln!("Fault: invalid PID calculation in Running");
             return;
         }
-        self.check_motion_faults(now);
+        self.check_motion_faults(now, RUNNING_OUTPUT_ENABLED);
     }
 
     // 回正到两个电机的原始单圈角度零位。
@@ -521,20 +528,12 @@ impl Control {
             rtt_target::rprintln!("Fault: invalid PID calculation in Prepare");
             return;
         }
-        if self.check_motion_faults(now) {
+        if self.check_motion_faults(now, PREPARE_OUTPUT_ENABLED) {
             return;
         }
 
-        let yaw_angle_error = self
-            .yaw
-            .motor
-            .angle_rad
-            .min(core::f32::consts::TAU - self.yaw.motor.angle_rad);
-        let pitch_angle_error = self
-            .pitch
-            .motor
-            .angle_rad
-            .min(core::f32::consts::TAU - self.pitch.motor.angle_rad);
+        let yaw_angle_error = self.yaw.motor.angle_rad.min(core::f32::consts::TAU - self.yaw.motor.angle_rad);
+        let pitch_angle_error = self.pitch.motor.angle_rad.min(core::f32::consts::TAU - self.pitch.motor.angle_rad);
         let settled = yaw_angle_error <= PREPARE_ANGLE_TOLERANCE_RAD
             && pitch_angle_error <= PREPARE_ANGLE_TOLERANCE_RAD
             && self.yaw.motor.speed_rpm.abs() <= PREPARE_SPEED_TOLERANCE_RPM
@@ -557,14 +556,9 @@ impl Control {
     pub fn update_mode(&mut self) {
         let right_switch = self.remote.map(|remote| remote.right_switch);
         let left_switch = self.remote.map(|remote| remote.left_switch);
-        let previous_switch = self.previous_right_switch;
         self.previous_right_switch = right_switch;
         let previous_left_switch = self.previous_left_switch;
         self.previous_left_switch = left_switch;
-
-        if self.fault.is_some() {
-            self.state = State::Error;
-        }
 
         if self.state == State::Error {
             self.armed = false;
@@ -590,23 +584,17 @@ impl Control {
             Some(3) => {
                 let enable_requested = self.armed;
                 self.armed = false;
-                match self.state {
-                    State::Waiting if enable_requested => {
-                        self.state = State::Prepare;
-                    }
-                    State::Normal => self.state = State::Waiting,
-                    State::Waiting | State::Prepare | State::Running => {}
-                    State::Error => {}
+                if enable_requested {
+                    self.state = State::Prepare;
+                } else if self.state == State::Normal {
+                    self.state = State::Waiting;
                 }
             }
             //（prepare切running逻辑是在update_prepare_mode中处理的）
 
             Some(1) => {
-                let normal_requested = self.armed && self.state == State::Waiting;
+                let normal_requested = self.armed;
                 self.armed = false;
-                if self.state == State::Waiting && !normal_requested && previous_switch != Some(1) {
-                    rtt_target::rprintln!("Normal disabled: move right switch down first");
-                }
                 match self.state {
                     State::Waiting if normal_requested => self.state = State::Normal,
                     State::Prepare | State::Running => self.state = State::Waiting,
@@ -626,7 +614,7 @@ impl Control {
         let now = Instant::now();
 
         match self.state {
-            State::Normal => self.update_normal_mode(now),
+            State::Normal => self.update_normal_mode(now, previous_state != State::Normal),
             State::Prepare => {
                 self.update_prepare_mode(now, previous_state != State::Prepare);
             }
@@ -724,7 +712,7 @@ async fn control_task(mut can: Can1, mut watchdog: dm_mc02::Watchdog) {
         {
             last_remote_debug = now;
             rtt_target::rprintln!(
-                "Status: state={:?}, fault={:?}, yaw_age={:?}, yaw_angle={}, yaw_rpm={}, yaw_target={}, yaw_voltage={}, tx_failed={}, invalid_feedback={}, can_errors={}",
+                "Status: state={:?}, fault={:?}, yaw_age={:?}, yaw_angle={}, yaw_rpm={}, yaw_target={}, yaw_voltage={}, tx_failed={}, invalid_feedback={}, can_errors={}, armed={}",
                 control.state,
                 control.fault,
                 control.yaw_feedback_age,
@@ -735,6 +723,7 @@ async fn control_task(mut can: Can1, mut watchdog: dm_mc02::Watchdog) {
                 control.tx_failed,
                 control.invalid_feedback,
                 control.can_errors,
+                control.armed,
             );
             rtt_target::rprintln!(
                 "Pitch feedback: age={:?}, angle_rad={}, speed_rpm={}",
