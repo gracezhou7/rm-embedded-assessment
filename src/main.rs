@@ -5,6 +5,7 @@
 mod dm_mc02;
 mod fault;
 mod pid;
+mod pid_tuning;
 
 use dm_mc02::Can1;
 use embassy_executor::Spawner;
@@ -12,6 +13,7 @@ use embassy_stm32::can::Frame;
 use embassy_time::{Duration, Instant, Ticker};
 use fault::{AxisFaultMonitor, Fault, OSCILLATION_DETECTION_DURATION};
 use pid::{Pid, PidError};
+use pid_tuning::RttPidTuner;
 
 // GM6020 电压模式组指令，适用于电机 ID 1～4。
 const MOTOR_COMMAND_ID: u16 = 0x1FF;
@@ -22,11 +24,11 @@ const PITCH_FEEDBACK_ID: u16 = 0x206;
 const REMOTE_SILENT_TICKS: u16 = 100;
 const TICK: Duration = Duration::from_millis(1);
 const CONTROL_DT_S: f32 = 0.001;
-const PREPARE_ANGLE_TOLERANCE_RAD: f32 = 0.01;
-const PREPARE_SPEED_TOLERANCE_RPM: f32 = 1.0;
+const PREPARE_ANGLE_TOLERANCE_RAD: f32 = 0.1;
+const PREPARE_SPEED_TOLERANCE_RPM: f32 = 6.0;
 const PREPARE_SETTLE_DURATION: Duration = Duration::from_millis(100);
 const PREPARE_SWITCH_DWELL: Duration = Duration::from_millis(1000);
-const MAX_TARGET_RATE_RAD_S: f32 = 1.0;
+const MAX_TARGET_RATE_RAD_S: f32 = 10.0;
 const STICK_DEADZONE: f32 = 0.05;
 // 遥控器调试日志的开关和输出间隔。
 const REMOTE_DEBUG_ENABLED: bool = true;
@@ -135,15 +137,15 @@ pub struct Control {
 impl Default for Control {
     fn default() -> Self {
         let speed_pid_yaw = Pid {
-            kp: 90.0,
-            ki: 0.0,
+            kp: 80.0,
+            ki: 50.0,
             kd: 0.0,
             maxout: 25000.0,
             integral_limit: 12500.0,
             ..Pid::default()
         };
         let pos_pid_yaw = Pid {
-            kp: 0.0,
+            kp: 40.0,
             ki: 0.0,
             kd: 0.0,
             maxout: 200.0,
@@ -151,7 +153,7 @@ impl Default for Control {
             ..Pid::default()
         };
         let pos_pid_pitch: Pid = Pid {
-            kp: 0.0,
+            kp: 40.0,
             ki: 0.0,
             kd: 0.0,
             maxout: 200.0,
@@ -159,8 +161,8 @@ impl Default for Control {
             ..Pid::default()
         };
         let speed_pid_pitch = Pid {
-            kp: 90.0,
-            ki: 0.0,
+            kp: 80.0,
+            ki: 50.0,
             kd: 0.0,
             maxout: 25000.0,
             integral_limit: 12500.0,
@@ -689,19 +691,39 @@ impl Control {
 // 初始化 RTT 和开发板，然后启动遥控器任务和控制任务。
 #[embassy_executor::main]
 async fn main(spawner: Spawner) { //Spawner是Embassy提供的任务启动器
-    rtt_target::rtt_init_print!(rtt_target::ChannelMode::NoBlockTrim, 1024);
+    let rtt_channels = rtt_target::rtt_init! {
+        up: {
+            0: {
+                size: 1024,
+                mode: rtt_target::ChannelMode::NoBlockTrim,
+                name: "Terminal"
+            }
+        }
+        down: {
+            0: {
+                size: 256,
+                name: "PID commands"
+            }
+        }
+    };
+    rtt_target::set_print_channel(rtt_channels.up.0);
     let (can, watchdog, remote) = dm_mc02::init();
     rtt_target::rprintln!("Gimbal control started");
-    rtt_target::rprintln!("hello!");
+    rtt_target::rprintln!("Send 'help' on RTT down channel 0 for PID commands");
+    let pid_tuner = RttPidTuner::new(rtt_channels.down.0);
     //启动两个异步任务
     spawner.spawn(dm_mc02::remote_task(remote).unwrap());
-    spawner.spawn(control_task(can, watchdog).unwrap());
+    spawner.spawn(control_task(can, watchdog, pid_tuner).unwrap());
 }
 
 // 以 1 kHz 运行 `tick`，每次完成后喂看门狗。如果某个周期卡住，
 // 看门狗会在约 100 ms 后复位 MCU。
 #[embassy_executor::task]
-async fn control_task(mut can: Can1, mut watchdog: dm_mc02::Watchdog) {
+async fn control_task(
+    mut can: Can1,
+    mut watchdog: dm_mc02::Watchdog,
+    mut pid_tuner: RttPidTuner,
+) {
     let mut control = Control::default();
     let mut ticker = Ticker::every(TICK);
     let mut last = Instant::now();
@@ -719,6 +741,7 @@ async fn control_task(mut can: Can1, mut watchdog: dm_mc02::Watchdog) {
             }
         }
         last = now;
+        pid_tuner.poll(&mut control);
         control.tick(&mut can);
         watchdog.pet();
         if REMOTE_DEBUG_ENABLED
@@ -754,8 +777,9 @@ async fn control_task(mut can: Can1, mut watchdog: dm_mc02::Watchdog) {
             match control.remote {
                 Some(remote) => {
                     rtt_target::rprintln!(
-                        "Remote: channels={:?}, right_switch={}, left_switch={}, mouse={:?}, mouse_left={}, mouse_right={}, keys=0x{:04X}",
+                        "Remote: channels={:?}, raw_channels={:?}, right_switch={}, left_switch={}, mouse={:?}, mouse_left={}, mouse_right={}, keys=0x{:04X}",
                         remote.channels,
+                        remote.channels.map(|channel| channel + 1024),
                         remote.right_switch,
                         remote.left_switch,
                         remote.mouse,

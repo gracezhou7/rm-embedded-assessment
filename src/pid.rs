@@ -40,7 +40,6 @@ impl Pid {
             return Err(PidError::InvalidConfiguration);
         }
         let error = target - measured;
-        rtt_target::rprintln!("error: {}", error);
         let integral = self.integral + error * dt_s;
         let derivative = match self.previous_error {
             Some(previous) => (error - previous) / dt_s,
