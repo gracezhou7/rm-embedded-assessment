@@ -2,12 +2,33 @@ use embassy_time::{Duration, Instant};
 
 use crate::Axis;
 
-const STALL_DETECTION_ENABLED: bool = false;
-const OSCILLATION_DETECTION_ENABLED: bool = false;
-const STALL_MIN_TARGET_RPM: f32 = 5.0;
-const STALL_MIN_OUTPUT: f32 = 80.0;
-const STALL_MAX_SPEED_RPM: f32 = 1.0;
-const STALL_DETECTION_DURATION: Duration = Duration::from_millis(500);
+const OSCILLATION_DETECTION_ENABLED: bool = true;
+
+#[derive(Clone, Copy)]
+pub(crate) struct StallConfig {
+    enabled: bool,
+    min_target_rpm: f32,
+    min_output: f32,
+    max_speed_rpm: f32,
+    duration: Duration,
+}
+
+pub(crate) const YAW_STALL_CONFIG: StallConfig = StallConfig {
+    enabled: true,
+    min_target_rpm: 5.0,
+    min_output: 1000.0,
+    max_speed_rpm: 1.0,
+    duration: Duration::from_millis(1000),
+};
+
+pub(crate) const PITCH_STALL_CONFIG: StallConfig = StallConfig {
+    enabled: true,
+    min_target_rpm: 20.0,
+    min_output: 10000.0,
+    max_speed_rpm: 0.01,
+    duration: Duration::from_millis(1000),
+};
+
 const OSCILLATION_MIN_AMPLITUDE_RAD: f32 = 0.02;
 const OSCILLATION_MAX_PERIOD: Duration = Duration::from_millis(333);
 pub(crate) const OSCILLATION_DETECTION_DURATION: Duration = Duration::from_millis(500);
@@ -50,15 +71,16 @@ impl AxisFaultMonitor {
         axis: &Axis,
         now: Instant,
         output_enabled: bool,
+        stall_config: StallConfig,
     ) -> Option<Fault> {
-        let stalled = STALL_DETECTION_ENABLED
+        let stalled = stall_config.enabled
             && output_enabled
-            && axis.target_rpm.abs() >= STALL_MIN_TARGET_RPM
-            && axis.motor.command_voltage.abs() >= STALL_MIN_OUTPUT
-            && axis.motor.speed_rpm.abs() <= STALL_MAX_SPEED_RPM;
+            && axis.target_rpm.abs() >= stall_config.min_target_rpm
+            && axis.motor.command_voltage.abs() >= stall_config.min_output
+            && axis.motor.speed_rpm.abs() <= stall_config.max_speed_rpm;
         if stalled {
             let since = *self.stall_since.get_or_insert(now);
-            if now.saturating_duration_since(since) >= STALL_DETECTION_DURATION {
+            if now.saturating_duration_since(since) >= stall_config.duration {
                 return Some(Fault::Stalled);
             }
         } else {

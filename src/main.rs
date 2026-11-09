@@ -11,7 +11,10 @@ use dm_mc02::Can1;
 use embassy_executor::Spawner;
 use embassy_stm32::can::Frame;
 use embassy_time::{Duration, Instant, Ticker};
-use fault::{AxisFaultMonitor, Fault, OSCILLATION_DETECTION_DURATION};
+use fault::{
+    AxisFaultMonitor, Fault, OSCILLATION_DETECTION_DURATION, PITCH_STALL_CONFIG,
+    YAW_STALL_CONFIG,
+};
 use pid::{Pid, PidError};
 use pid_tuning::RttPidTuner;
 use tuning_studio_api::{watch, watch_mut};
@@ -34,7 +37,7 @@ const PITCH_MAX_TARGET_RATE_RAD_S: f32 = 2.0;
 
 const STICK_DEADZONE: f32 = 0.05;
 // channel 2 中位静止时约偏大 100；按实际静止均值校准。
-const YAW_CHANNEL_OFFSET: i16 = 100;
+const YAW_CHANNEL_OFFSET: i16 = 0;
 // 遥控器调试日志的开关和输出间隔。
 const REMOTE_DEBUG_ENABLED: bool = true;
 const REMOTE_DEBUG_INTERVAL: Duration = Duration::from_millis(500);
@@ -49,7 +52,11 @@ const NORMAL_FEEDBACK_TIMEOUT: Duration = Duration::from_millis(100);
 
 //零位姿时电机角度
 const YAW_CALIB_ANGLE_RAD: f32 = 2.5564;
-const PITCH_CALIB_ANGLE_RAD: f32 = 3.1000;
+const PITCH_CALIB_ANGLE_RAD: f32 = 3.1500;
+
+// Pitch 目标角相对校准角的软限位；应设在机械硬限位以内。
+const PITCH_MIN_ANGLE_RAD: f32 = -0.35;
+const PITCH_MAX_ANGLE_RAD: f32 = 0.35;
 
 
 /// 单个电机的反馈数据和电压指令。
@@ -246,7 +253,7 @@ impl Control {
     fn check_motion_faults(&mut self, now: Instant, output_enabled: bool) -> bool {
         if let Some(fault) = self
             .yaw_fault_monitor
-            .update(&self.yaw, now, output_enabled)
+            .update(&self.yaw, now, output_enabled, YAW_STALL_CONFIG)
         {
             if fault == Fault::Oscillating {
                 self.fail(fault);
@@ -263,7 +270,7 @@ impl Control {
         }
         if let Some(fault) = self
             .pitch_fault_monitor
-            .update(&self.pitch, now, output_enabled)
+            .update(&self.pitch, now, output_enabled, PITCH_STALL_CONFIG)
         {
             if fault == Fault::Oscillating {
                 self.fail(fault);
@@ -283,7 +290,7 @@ impl Control {
 
     fn recover_from_fault(&mut self) {
         self.fault = None;
-        self.state = State::Running;
+        self.state = State::Waiting;
         self.prepare_switch_since = None;
         self.yaw.target_angle_rad = self.yaw.motor.angle_rad;
         self.pitch.target_angle_rad = self.pitch.motor.angle_rad;
@@ -443,6 +450,13 @@ impl Control {
         (i32::from(channel) - i32::from(offset)).clamp(-660, 660) as i16
     }
 
+    fn limit_pitch_target_angle(angle_rad: f32) -> f32 {
+        angle_rad.clamp(
+            PITCH_CALIB_ANGLE_RAD + PITCH_MIN_ANGLE_RAD,
+            PITCH_CALIB_ANGLE_RAD + PITCH_MAX_ANGLE_RAD,
+        )
+    }
+
     fn update_normal_mode(&mut self, now: Instant, entered: bool) {
         if entered {
             self.yaw.speed_pid.reset();
@@ -480,7 +494,8 @@ impl Control {
 
         if entered {
             self.yaw.target_angle_rad = self.yaw.motor.angle_rad;
-            self.pitch.target_angle_rad = self.pitch.motor.angle_rad;
+            self.pitch.target_angle_rad =
+                Self::limit_pitch_target_angle(self.pitch.motor.angle_rad);
             self.yaw.position_pid.reset();
             self.yaw.speed_pid.reset();
             self.pitch.position_pid.reset();
@@ -501,12 +516,10 @@ impl Control {
             } else if self.yaw.target_angle_rad < 0.0 {
                 self.yaw.target_angle_rad += core::f32::consts::TAU;
             }
-            self.pitch.target_angle_rad += pitch_input * PITCH_MAX_TARGET_RATE_RAD_S * CONTROL_PERIOD_S;
-            if self.pitch.target_angle_rad >= core::f32::consts::TAU {
-                self.pitch.target_angle_rad -= core::f32::consts::TAU;
-            } else if self.pitch.target_angle_rad < 0.0 {
-                self.pitch.target_angle_rad += core::f32::consts::TAU;
-            }
+            self.pitch.target_angle_rad = Self::limit_pitch_target_angle(
+                self.pitch.target_angle_rad
+                    + pitch_input * PITCH_MAX_TARGET_RATE_RAD_S * CONTROL_PERIOD_S,
+            );
         }
 
         if Self::update_axis_control(&mut self.yaw).is_err()
@@ -590,7 +603,7 @@ impl Control {
                     && remote.channels[3].abs() <= (STICK_DEADZONE * 660.0) as i16
             });
             if right_switch == Some(3)
-                && left_switch == Some(1)
+                && left_switch == Some(3)
                 && previous_left_switch == Some(2)
                 && sticks_centered
             {
@@ -802,11 +815,17 @@ async fn control_task(
                 control.armed,
             );
             rtt_target::rprintln!(
-                "Pitch feedback: age={:?}, angle_rad={}, angle_error_rad={}, speed_rpm={}",
+                "Status: axis=pitch, pitch_age={:?}, pitch_angle={}, pitch_error={}, pitch_rpm={}, pitch_target={}, pitch_voltage={}, tx_failed={}, invalid_feedback={}, can_errors={}, armed={}",
                 control.pitch_feedback_age,
                 control.pitch.motor.angle_rad,
                 control.pitch.angle_error_rad,
                 control.pitch.motor.speed_rpm,
+                control.pitch.target_rpm,
+                control.pitch.motor.command_voltage,
+                control.tx_failed,
+                control.invalid_feedback,
+                control.can_errors,
+                control.armed,
             );
             rtt_target::rprintln!(
                 "CAN TX attempt: id=0x{:03X}, data={:02X?}, queued={}",
