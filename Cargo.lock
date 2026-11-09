@@ -106,6 +106,7 @@ dependencies = [
  "embedded-can",
  "rtt-target",
  "static_cell",
+ "tuning-studio-api",
 ]
 
 [[package]]
@@ -983,6 +984,25 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 1.0.109",
+]
+
+[[package]]
+name = "tuning-studio-api"
+version = "0.2.0"
+source = "git+https://github.com/hxyulin/tuning-studio#eec468fb8021b7ec1166e98e37f299d2fe09f144"
+dependencies = [
+ "critical-section",
+ "tuning-studio-api-macros",
+]
+
+[[package]]
+name = "tuning-studio-api-macros"
+version = "0.2.0"
+source = "git+https://github.com/hxyulin/tuning-studio#eec468fb8021b7ec1166e98e37f299d2fe09f144"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]

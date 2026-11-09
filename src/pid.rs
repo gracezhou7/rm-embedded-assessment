@@ -23,10 +23,10 @@ impl Pid {
         self.previous_error = None;
     }
 
-    /// `target` 和 `measured` 使用相同单位；`dt_s` 的单位为秒。
-    /// 调用方通过增益确定输出单位。
-    pub fn calculate(&mut self, target: f32, measured: f32, dt_s: f32) -> Result<f32, PidError> {
-        if !target.is_finite() || !measured.is_finite() || !dt_s.is_finite() || dt_s <= 0.0 {
+    /// `target` 和 `measured` 使用相同单位；积分和微分按每次调用更新。
+    /// 调用方通过增益确定输出单位，控制周期改变后需要重新调参。
+    pub fn calculate(&mut self, target: f32, measured: f32) -> Result<f32, PidError> {
+        if !target.is_finite() || !measured.is_finite() {
             return Err(PidError::InvalidInput);
         }
         if !self.kp.is_finite()
@@ -40,9 +40,9 @@ impl Pid {
             return Err(PidError::InvalidConfiguration);
         }
         let error = target - measured;
-        let integral = self.integral + error * dt_s;
+        let integral = self.integral + error;
         let derivative = match self.previous_error {
-            Some(previous) => (error - previous) / dt_s,
+            Some(previous) => error - previous,
             None => 0.0,
         };
         if !error.is_finite() || !integral.is_finite() || !derivative.is_finite() {
@@ -56,5 +56,37 @@ impl Pid {
         self.integral = integral;
         self.previous_error = Some(error);
         Ok(output.clamp(-self.maxout, self.maxout))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Pid;
+
+    #[test]
+    fn integral_accumulates_error_per_call() {
+        let mut pid = Pid {
+            ki: 2.0,
+            maxout: 100.0,
+            integral_limit: 10.0,
+            ..Pid::default()
+        };
+
+        assert_eq!(pid.calculate(3.0, 0.0), Ok(6.0));
+        assert_eq!(pid.calculate(3.0, 0.0), Ok(12.0));
+        assert_eq!(pid.integral, 6.0);
+    }
+
+    #[test]
+    fn derivative_uses_error_difference_per_call() {
+        let mut pid = Pid {
+            kd: 2.0,
+            maxout: 100.0,
+            integral_limit: 0.0,
+            ..Pid::default()
+        };
+
+        assert_eq!(pid.calculate(3.0, 0.0), Ok(0.0));
+        assert_eq!(pid.calculate(5.0, 0.0), Ok(4.0));
     }
 }

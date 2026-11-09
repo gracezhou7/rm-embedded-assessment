@@ -91,6 +91,10 @@ set yaw speed 75 0 0 25000 12500
 
 `set` 的参数依次为轴（`yaw`/`pitch`）、控制环（`position`/`speed`）、`kp`、`ki`、`kd`、`maxout` 和 `integral_limit`。修改仅在当前运行期间生效，不会写入非易失存储；每次成功修改都会清空该 PID 的积分和误差历史。参数必须是有限数值，两个限幅不能为负数。此接口会直接影响控制输出，请先确保设备处于安全状态并使用小幅度参数调整。
 
+### 使用 Tuning Studio 实时调 PID
+
+固件集成了 `tuning-studio-api`。在 Tuning Studio 的 Live Watch 中可编辑 `yaw.position.*`、`yaw.speed.*`、`pitch.position.*`、`pitch.speed.*` 下的 `kp`、`ki`、`kd`；编辑会在下一个控制周期应用。这里使用 `watch_mut!` 暴露已有 PID 字段，不带范围和步长限制；原有 RTT `set` 命令仍可使用。修改只在本次运行中有效，重启后恢复固件默认值。调参会直接影响控制输出，请先确保设备处于安全状态并小幅修改。两轴角度目标/反馈/误差、速度目标/反馈和电压指令也会作为只读值出现在 Live Watch 中。
+
 ### 3. 一个控制周期做什么？
 
 模板每 1 ms 执行一次控制，也就是 1 kHz。顺序已经搭好：
@@ -240,12 +244,11 @@ impl Pid {
         &mut self,
         _target: f32,
         _measured: f32,
-        _dt_s: f32,
     ) -> f32 { todo!("实现 PID 运算"); }
 }
 ```
 
-上面是接口节选，不是完整实现。速度环输入为 rpm，输出为电压原始值，每次调用的 `dt_s` 为 `0.001`。你需要添加增益、积分、历史数据和限制，并完成 `reset`、`calculate`。
+上面是接口节选，不是完整实现。速度环输入为 rpm，输出为电压原始值。当前实现按每次调用更新积分和误差差分，不传入 `dt_s`；因此 `ki`、`kd` 是按控制周期定义的参数，改变控制周期后需要重新调参。若从旧的按秒计算实现按 1 ms 周期换算以保持近似效果，`ki` 乘以 `0.001`、`kd` 除以 `0.001`，积分限幅除以 `0.001`；这些只是换算起点，实机仍需重新调参。你需要添加增益、积分、历史数据和限制，并完成 `reset`、`calculate`。
 
 双环的连接为：`Axis::target_angle_rad` 交给 `position_pid`，它的输出写入 `target_rpm`，再交给 `speed_pid`，最后得到该轴电机的 `command_voltage_raw`。`yaw`、`pitch` 各有一组 PID，历史状态互不影响。若位置环输出 rad/s，先换算成 rpm 再接速度环。
 
@@ -379,7 +382,7 @@ GM6020 提供单圈绝对角度反馈，原始机械角度范围为 `0～8191`�
 |---|---|
 | `Pid` | 添加参数、积分、历史数据及限制 |
 | `Pid::reset` | 清理历史状态，定义首次计算的初始化方式 |
-| `Pid::calculate` | 使用时间间隔计算 PID，处理积分与输出限制 |
+| `Pid::calculate` | 按每次调用计算 PID，处理积分与输出限制 |
 | `Control`、`Default` | 设置两轴的 PID 参数，添加反馈年龄、故障记录等 |
 | `Control::update_mode` | 完整的判断、切换和进入／退出处理 |
 | `Control::update` | 回正、遥控双环控制及禁止输出状态下的具体行为 |
@@ -423,25 +426,26 @@ Ki 为0时积分贡献应为0，reset 后历史积分应清零。PID 参数字�
 code --install-extension hxyulin.tuning-studio
 ```
 
-### 2. 编译并烧录
+### 2. 通过 Tuning Studio 启动固件
 
-```sh
-cargo build --release --locked
-cargo run --release --locked
+先停止其他占用调试探针的 probe-rs 或 VS Code 调试会话。在工作区 `.vscode/settings.json` 中设置 release 构建参数：
+
+```json
+{
+  "tuningStudio.cargoArgs": ["--release", "--locked"]
+}
 ```
 
-确认固件运行后，在终端按 Ctrl+C 退出 probe-rs 日志会话，释放调试探针。此操作不等于 disable，操作电机仍使用右上拨杆。VS Code 调试器和 Tuning Studio 也不能同时占用同一个探针。
+打开 Tuning Studio 侧栏并点击 **Run Firmware**。扩展会构建、烧录并启动会话，构建和 RTT 日志显示在它打开的终端中。本项目 `.cargo/config.toml` 已提供芯片和目标配置；扩展在 Run 时临时接管 Cargo runner。停止会话不等于 disable，操作电机仍使用右上拨杆。
 
-### 3. 连接并画曲线
+### 3. Live Watch 调参与曲线
 
 本节按 Tuning Studio 0.1.3 编写，更早的版本界面不同。
 
-1. 命令面板执行 `Tuning Studio: Open Scope`，或者点击VScode左边插件栏的图标打开 Tuning Scope 面板。
-2. 点击面板左上角 **Open firmware…**，选择本次烧录对应的 `target/thumbv7em-none-eabihf/release/control-training-template`。这是不带扩展名的固件文件，不是 `.rs` 源码。不要选择旧编译结果。
-3. 点击右上角 **Connect…**，选择 SWD 调试探针和芯片 `STM32H723VGTx`。
-4. 左侧 Live Watch 中展开 **Tasks → control_task → control**，里面是 `Control` 的全部字段，例如 `yaw`、`pitch`、`state`。顶部输入框可按名称筛选。
-5. 点击数值右侧的方块，把该字段加入右侧曲线；再点一次取消。
-6. 工具栏可选择 2、5、10、30 s 时间窗口，**Pause** 暂停画面，**Record** 开始记录到工程的 `.tuning-studio/recordings/`，再点一次停止。
+1. Run Firmware 成功启动后，Live Watch 自动显示通过 `watch_mut!` 暴露的 PID 增益，以及 `watch!` 发布的遥测。
+2. 点击可编辑的 `kp`、`ki`、`kd` 值，输入后按 Enter；固件在下一个控制周期应用修改。只读遥测行可加入 Plot。
+3. 角度误差、目标/反馈速度和电压指令可用于观察调参结果。Live Watch 主机轮询采样低于固件 1 kHz 控制频率，短暂变化可能不会被采到。
+4. 工具栏可选择时间窗口，**Pause** 暂停画面，**Record** 开始记录到工程的 `.tuning-studio/recordings/`，再点一次停止。
 
 默认采样率为 100 Hz，可用 `Tuning Studio: Change Sample Rate…` 修改。控制循环仍为 1 kHz，曲线采样率不是控制频率；较慢采样不能证明没有高频抖动。
 

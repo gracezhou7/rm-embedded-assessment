@@ -14,6 +14,7 @@ use embassy_time::{Duration, Instant, Ticker};
 use fault::{AxisFaultMonitor, Fault, OSCILLATION_DETECTION_DURATION};
 use pid::{Pid, PidError};
 use pid_tuning::RttPidTuner;
+use tuning_studio_api::{watch, watch_mut};
 
 // GM6020 电压模式组指令，适用于电机 ID 1～4。
 const MOTOR_COMMAND_ID: u16 = 0x1FF;
@@ -23,24 +24,33 @@ const PITCH_FEEDBACK_ID: u16 = 0x206;
 // 判定遥控器失联所需的连续无输入控制周期数。
 const REMOTE_SILENT_TICKS: u16 = 100;
 const TICK: Duration = Duration::from_millis(1);
-const CONTROL_DT_S: f32 = 0.001;
+const CONTROL_PERIOD_S: f32 = 0.001;
 const PREPARE_ANGLE_TOLERANCE_RAD: f32 = 0.1;
 const PREPARE_SPEED_TOLERANCE_RPM: f32 = 6.0;
 const PREPARE_SETTLE_DURATION: Duration = Duration::from_millis(100);
 const PREPARE_SWITCH_DWELL: Duration = Duration::from_millis(1000);
-const MAX_TARGET_RATE_RAD_S: f32 = 10.0;
+const YAW_MAX_TARGET_RATE_RAD_S: f32 = 20.0;
+const PITCH_MAX_TARGET_RATE_RAD_S: f32 = 2.0;
+
 const STICK_DEADZONE: f32 = 0.05;
+// channel 2 中位静止时约偏大 100；按实际静止均值校准。
+const YAW_CHANNEL_OFFSET: i16 = 100;
 // 遥控器调试日志的开关和输出间隔。
 const REMOTE_DEBUG_ENABLED: bool = true;
 const REMOTE_DEBUG_INTERVAL: Duration = Duration::from_millis(500);
 //状态使能。
 const PREPARE_OUTPUT_ENABLED: bool = true;
-const NORMAL_OUTPUT_ENABLED: bool = true;
+const NORMAL_OUTPUT_ENABLED: bool = false;
 const RUNNING_OUTPUT_ENABLED: bool = true;
 // 电压给定值为协议原始数值，不是伏特。
 const MAX_VOLTAGE_COMMAND: f32 = 25000.0;
 // 临时阈值，需要结合现场反馈间隔和接收时序确认。
 const NORMAL_FEEDBACK_TIMEOUT: Duration = Duration::from_millis(100);
+
+//零位姿时电机角度
+const YAW_CALIB_ANGLE_RAD: f32 = 2.5564;
+const PITCH_CALIB_ANGLE_RAD: f32 = 3.1000;
+
 
 /// 单个电机的反馈数据和电压指令。
 #[derive(Default)]
@@ -97,6 +107,8 @@ pub struct Axis {
     pub joint_angle_rad: Option<f32>,
     /// 位置环目标，单位为 rad。
     pub target_angle_rad: f32,
+    /// 环绕修正后的目标角与反馈角之差，范围为 [-π, π]。
+    pub angle_error_rad: f32,
     /// 速度环目标，单位为 rpm，由位置环输出设定。
     pub target_rpm: f32,
     /// 位置环：输入单位为 rad，输出单位为 rpm。
@@ -137,35 +149,35 @@ pub struct Control {
 impl Default for Control {
     fn default() -> Self {
         let speed_pid_yaw = Pid {
-            kp: 80.0,
-            ki: 50.0,
-            kd: 0.0,
+            kp: 100.0,
+            ki: 0.01,
+            kd: 0.1,
             maxout: 25000.0,
-            integral_limit: 12500.0,
+            integral_limit: 12000.0,
             ..Pid::default()
         };
         let pos_pid_yaw = Pid {
-            kp: 40.0,
-            ki: 0.0,
-            kd: 0.0,
+            kp: 100.0,
+            ki: 0.01,
+            kd: 0.5,
             maxout: 200.0,
-            integral_limit: 100.0,
+            integral_limit: 2000.0,
             ..Pid::default()
         };
         let pos_pid_pitch: Pid = Pid {
-            kp: 40.0,
-            ki: 0.0,
-            kd: 0.0,
+            kp: 300.0,
+            ki: 5.0,
+            kd: 2.0,
             maxout: 200.0,
-            integral_limit: 100.0,
+            integral_limit: 20.0,
             ..Pid::default()
         };
         let speed_pid_pitch = Pid {
-            kp: 80.0,
-            ki: 50.0,
-            kd: 0.0,
+            kp: 100.0,
+            ki: 0.01,
+            kd: 0.05,
             maxout: 25000.0,
-            integral_limit: 12500.0,
+            integral_limit: 250000.0,
             ..Pid::default()
         };
         let yaw = Axis {
@@ -397,26 +409,24 @@ impl Control {
     }
 
     fn update_axis_control(axis: &mut Axis) -> Result<(), PidError> {
-        let mut angle_error = axis.target_angle_rad - axis.motor.angle_rad;
-        if angle_error > core::f32::consts::PI {
-            angle_error -= core::f32::consts::TAU;
-        } else if angle_error < -core::f32::consts::PI {
-            angle_error += core::f32::consts::TAU;
+        axis.angle_error_rad = axis.target_angle_rad - axis.motor.angle_rad;
+        if axis.angle_error_rad > core::f32::consts::PI {
+            axis.angle_error_rad -= core::f32::consts::TAU;
+        } else if axis.angle_error_rad < -core::f32::consts::PI {
+            axis.angle_error_rad += core::f32::consts::TAU;
         }
-        let measured_angle = axis.target_angle_rad - angle_error;
-        axis.target_rpm =
-            axis.position_pid
-                .calculate(axis.target_angle_rad, measured_angle, CONTROL_DT_S)?;
+        let measured_angle = axis.target_angle_rad - axis.angle_error_rad;
+        axis.target_rpm = axis
+            .position_pid
+            .calculate(axis.target_angle_rad, measured_angle)?;
         Self::update_speed_control(axis)?;
         Ok(())
     }
 
     fn update_speed_control(axis: &mut Axis) -> Result<(), PidError> {
-        axis.motor.command_voltage = axis.speed_pid.calculate(
-            axis.target_rpm,
-            axis.motor.speed_rpm,
-            CONTROL_DT_S,
-        )?;
+        axis.motor.command_voltage = axis
+            .speed_pid
+            .calculate(axis.target_rpm, axis.motor.speed_rpm)?;
         Ok(())
     }
 
@@ -427,6 +437,10 @@ impl Control {
         } else {
             input.signum() * (magnitude - STICK_DEADZONE) / (1.0 - STICK_DEADZONE)
         }
+    }
+
+    fn corrected_channel(channel: i16, offset: i16) -> i16 {
+        (i32::from(channel) - i32::from(offset)).clamp(-660, 660) as i16
     }
 
     fn update_normal_mode(&mut self, now: Instant, entered: bool) {
@@ -478,15 +492,16 @@ impl Control {
         }
 
         if let Some(remote) = self.remote {
-            let yaw_input = Self::apply_stick_deadzone(remote.channels[2] as f32 / 660.0);
+            let yaw_channel = Self::corrected_channel(remote.channels[2], YAW_CHANNEL_OFFSET);
+            let yaw_input = Self::apply_stick_deadzone(yaw_channel as f32 / 660.0);
             let pitch_input = Self::apply_stick_deadzone(remote.channels[3] as f32 / 660.0);
-            self.yaw.target_angle_rad += yaw_input * MAX_TARGET_RATE_RAD_S * CONTROL_DT_S;
+            self.yaw.target_angle_rad += yaw_input * YAW_MAX_TARGET_RATE_RAD_S * CONTROL_PERIOD_S;
             if self.yaw.target_angle_rad >= core::f32::consts::TAU {
                 self.yaw.target_angle_rad -= core::f32::consts::TAU;
             } else if self.yaw.target_angle_rad < 0.0 {
                 self.yaw.target_angle_rad += core::f32::consts::TAU;
             }
-            self.pitch.target_angle_rad += pitch_input * MAX_TARGET_RATE_RAD_S * CONTROL_DT_S;
+            self.pitch.target_angle_rad += pitch_input * PITCH_MAX_TARGET_RATE_RAD_S * CONTROL_PERIOD_S;
             if self.pitch.target_angle_rad >= core::f32::consts::TAU {
                 self.pitch.target_angle_rad -= core::f32::consts::TAU;
             } else if self.pitch.target_angle_rad < 0.0 {
@@ -507,8 +522,8 @@ impl Control {
     // 回正到两个电机的原始单圈角度零位。
     pub fn update_prepare_mode(&mut self, now: Instant, entered: bool) {
         if entered {
-            self.yaw.target_angle_rad = 0.0;
-            self.pitch.target_angle_rad = 0.0;
+            self.yaw.target_angle_rad = YAW_CALIB_ANGLE_RAD;
+            self.pitch.target_angle_rad = PITCH_CALIB_ANGLE_RAD;
             self.yaw.position_pid.reset();
             self.yaw.speed_pid.reset();
             self.pitch.position_pid.reset();
@@ -539,10 +554,8 @@ impl Control {
             return;
         }
 
-        let yaw_angle_error = self.yaw.motor.angle_rad.min(core::f32::consts::TAU - self.yaw.motor.angle_rad);
-        let pitch_angle_error = self.pitch.motor.angle_rad.min(core::f32::consts::TAU - self.pitch.motor.angle_rad);
-        let settled = yaw_angle_error <= PREPARE_ANGLE_TOLERANCE_RAD
-            && pitch_angle_error <= PREPARE_ANGLE_TOLERANCE_RAD
+        let settled = self.yaw.angle_error_rad.abs() <= PREPARE_ANGLE_TOLERANCE_RAD
+            && self.pitch.angle_error_rad.abs() <= PREPARE_ANGLE_TOLERANCE_RAD
             && self.yaw.motor.speed_rpm.abs() <= PREPARE_SPEED_TOLERANCE_RPM
             && self.pitch.motor.speed_rpm.abs() <= PREPARE_SPEED_TOLERANCE_RPM;
 
@@ -572,7 +585,8 @@ impl Control {
             self.armed = false;
             self.prepare_switch_since = None;
             let sticks_centered = self.remote.is_some_and(|remote| {
-                remote.channels[2].abs() <= (STICK_DEADZONE * 660.0) as i16
+                Self::corrected_channel(remote.channels[2], YAW_CHANNEL_OFFSET).abs()
+                    <= (STICK_DEADZONE * 660.0) as i16
                     && remote.channels[3].abs() <= (STICK_DEADZONE * 660.0) as i16
             });
             if right_switch == Some(3)
@@ -742,18 +756,43 @@ async fn control_task(
         }
         last = now;
         pid_tuner.poll(&mut control);
+        watch_mut!("yaw.position.kp": f32 = &mut control.yaw.position_pid.kp);
+        watch_mut!("yaw.position.ki": f32 = &mut control.yaw.position_pid.ki);
+        watch_mut!("yaw.position.kd": f32 = &mut control.yaw.position_pid.kd);
+        watch_mut!("yaw.speed.kp": f32 = &mut control.yaw.speed_pid.kp);
+        watch_mut!("yaw.speed.ki": f32 = &mut control.yaw.speed_pid.ki);
+        watch_mut!("yaw.speed.kd": f32 = &mut control.yaw.speed_pid.kd);
+        watch_mut!("pitch.position.kp": f32 = &mut control.pitch.position_pid.kp);
+        watch_mut!("pitch.position.ki": f32 = &mut control.pitch.position_pid.ki);
+        watch_mut!("pitch.position.kd": f32 = &mut control.pitch.position_pid.kd);
+        watch_mut!("pitch.speed.kp": f32 = &mut control.pitch.speed_pid.kp);
+        watch_mut!("pitch.speed.ki": f32 = &mut control.pitch.speed_pid.ki);
+        watch_mut!("pitch.speed.kd": f32 = &mut control.pitch.speed_pid.kd);
         control.tick(&mut can);
+        watch!("yaw.angle.target": f32 = control.yaw.target_angle_rad, unit = "rad");
+        watch!("yaw.angle.measured": f32 = control.yaw.motor.angle_rad, unit = "rad");
+        watch!("yaw.angle.error": f32 = control.yaw.angle_error_rad, unit = "rad");
+        watch!("yaw.speed.target": f32 = control.yaw.target_rpm, unit = "rpm");
+        watch!("yaw.speed.measured": f32 = control.yaw.motor.speed_rpm, unit = "rpm");
+        watch!("yaw.voltage.command": f32 = control.yaw.motor.command_voltage);
+        watch!("pitch.angle.target": f32 = control.pitch.target_angle_rad, unit = "rad");
+        watch!("pitch.angle.measured": f32 = control.pitch.motor.angle_rad, unit = "rad");
+        watch!("pitch.angle.error": f32 = control.pitch.angle_error_rad, unit = "rad");
+        watch!("pitch.speed.target": f32 = control.pitch.target_rpm, unit = "rpm");
+        watch!("pitch.speed.measured": f32 = control.pitch.motor.speed_rpm, unit = "rpm");
+        watch!("pitch.voltage.command": f32 = control.pitch.motor.command_voltage);
         watchdog.pet();
         if REMOTE_DEBUG_ENABLED
             && now.saturating_duration_since(last_remote_debug) >= REMOTE_DEBUG_INTERVAL
         {
             last_remote_debug = now;
             rtt_target::rprintln!(
-                "Status: state={:?}, fault={:?}, yaw_age={:?}, yaw_angle={}, yaw_rpm={}, yaw_target={}, yaw_voltage={}, tx_failed={}, invalid_feedback={}, can_errors={}, armed={}",
+                "Status: state={:?}, fault={:?}, yaw_age={:?}, yaw_angle={}, yaw_error={}, yaw_rpm={}, yaw_target={}, yaw_voltage={}, tx_failed={}, invalid_feedback={}, can_errors={}, armed={}",
                 control.state,
                 control.fault,
                 control.yaw_feedback_age,
                 control.yaw.motor.angle_rad,
+                control.yaw.angle_error_rad,
                 control.yaw.motor.speed_rpm,
                 control.yaw.target_rpm,
                 control.yaw.motor.command_voltage,
@@ -763,9 +802,10 @@ async fn control_task(
                 control.armed,
             );
             rtt_target::rprintln!(
-                "Pitch feedback: age={:?}, angle_rad={}, speed_rpm={}",
+                "Pitch feedback: age={:?}, angle_rad={}, angle_error_rad={}, speed_rpm={}",
                 control.pitch_feedback_age,
                 control.pitch.motor.angle_rad,
+                control.pitch.angle_error_rad,
                 control.pitch.motor.speed_rpm,
             );
             rtt_target::rprintln!(
