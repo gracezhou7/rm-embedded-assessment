@@ -32,6 +32,7 @@ const PREPARE_ANGLE_TOLERANCE_RAD: f32 = 0.1;
 const PREPARE_SPEED_TOLERANCE_RPM: f32 = 6.0;
 const PREPARE_SETTLE_DURATION: Duration = Duration::from_millis(100);
 const PREPARE_SWITCH_DWELL: Duration = Duration::from_millis(1000);
+// Running 中摇杆改变位置目标的最大角速度。
 const YAW_MAX_TARGET_RATE_RAD_S: f32 = 20.0;
 const PITCH_MAX_TARGET_RATE_RAD_S: f32 = 2.0;
 
@@ -50,7 +51,7 @@ const MAX_VOLTAGE_COMMAND: f32 = 25000.0;
 // 临时阈值，需要结合现场反馈间隔和接收时序确认。
 const NORMAL_FEEDBACK_TIMEOUT: Duration = Duration::from_millis(100);
 
-//零位姿时电机角度
+// 参考姿态对应的单圈电机角度。
 const YAW_CALIB_ANGLE_RAD: f32 = 2.5564;
 const PITCH_CALIB_ANGLE_RAD: f32 = 3.1500;
 
@@ -64,6 +65,9 @@ const PITCH_MAX_ANGLE_RAD: f32 = 0.35;
 pub struct Motor {
     /// 电机轴单圈角度，单位为 rad；不累计圈数。
     pub angle_rad: f32,
+    /// 根据相邻单圈反馈展开的连续角度，供位置环使用。
+    pub continuous_angle_rad: f32,
+    angle_initialized: bool,
     pub speed_rpm: f32,
     /// 接收到的反馈电流原始值，换算比例尚待确认。
     pub current_raw: i16,
@@ -84,9 +88,26 @@ impl Motor {
         }
         // TODO：在实际电机上核实转速和电流反馈的有符号编码。
         self.current_raw = i16::from_be_bytes([data[4], data[5]]);
-        self.angle_rad = angle_raw as f32 / 8192.0 * core::f32::consts::TAU;
+        let angle_rad = angle_raw as f32 / 8192.0 * core::f32::consts::TAU;
+        if self.angle_initialized {
+            self.continuous_angle_rad += single_turn_angle_delta(angle_rad - self.angle_rad);
+        } else {
+            self.continuous_angle_rad = angle_rad;
+            self.angle_initialized = true;
+        }
+        self.angle_rad = angle_rad;
         self.speed_rpm = i16::from_be_bytes([data[2], data[3]]) as f32;
         return true;
+    }
+}
+
+fn single_turn_angle_delta(delta: f32) -> f32 {
+    if delta > core::f32::consts::PI {
+        delta - core::f32::consts::TAU
+    } else if delta < -core::f32::consts::PI {
+        delta + core::f32::consts::TAU
+    } else {
+        delta
     }
 }
 
@@ -95,11 +116,11 @@ impl Motor {
 pub enum State {
     /// 零输出。等待有效遥控输入和两台电机的新鲜反馈，再等待一次新的使能请求。
     Waiting,
-    /// 回正模式，待实现。
+    /// 回正模式。
     Prepare,
-    /// yaw 以指定目标速度旋转，pitch 保持零电压指令。
+    /// 遥控调试模式：yaw、pitch 均使用位置环串速度环控制。
     Normal,
-    /// 遥控调试模式，待实现。
+    /// 遥控调试模式，两轴均使用位置环串速度环控制。
     Running,
     /// 保持零输出，直到人工恢复。
     Error,
@@ -112,11 +133,11 @@ pub struct Axis {
     /// 相对于参考姿态的标定关节角，不是电机原始角度。
     // TODO：确认零位、方向和传动关系后，根据有效反馈填写。
     pub joint_angle_rad: Option<f32>,
-    /// 位置环目标，单位为 rad。
+    /// 连续位置目标，单位为 rad，可超出单圈角度范围。
     pub target_angle_rad: f32,
-    /// 环绕修正后的目标角与反馈角之差，范围为 [-π, π]。
+    /// 连续目标角与连续反馈角之差，不折返到单圈最短误差。
     pub angle_error_rad: f32,
-    /// 速度环目标，单位为 rpm，由位置环输出设定。
+    /// 速度环目标，单位为 rpm，由位置环设定。
     pub target_rpm: f32,
     /// 位置环：输入单位为 rad，输出单位为 rpm。
     pub position_pid: Pid,
@@ -292,8 +313,8 @@ impl Control {
         self.fault = None;
         self.state = State::Waiting;
         self.prepare_switch_since = None;
-        self.yaw.target_angle_rad = self.yaw.motor.angle_rad;
-        self.pitch.target_angle_rad = self.pitch.motor.angle_rad;
+        self.yaw.target_angle_rad = self.yaw.motor.continuous_angle_rad;
+        self.pitch.target_angle_rad = self.pitch.motor.continuous_angle_rad;
         self.yaw.target_rpm = 0.0;
         self.pitch.target_rpm = 0.0;
         self.yaw.position_pid.reset();
@@ -304,9 +325,9 @@ impl Control {
         self.pitch_fault_monitor.reset();
         self.prepare_settled_since = None;
         rtt_target::rprintln!(
-            "Fault recovery: Running at current angles yaw={} rad, pitch={} rad; targets reset",
-            self.yaw.motor.angle_rad,
-            self.pitch.motor.angle_rad
+            "Fault recovery: targets reset to current continuous angles yaw={} rad, pitch={} rad",
+            self.yaw.motor.continuous_angle_rad,
+            self.pitch.motor.continuous_angle_rad
         );
     }
 
@@ -416,16 +437,10 @@ impl Control {
     }
 
     fn update_axis_control(axis: &mut Axis) -> Result<(), PidError> {
-        axis.angle_error_rad = axis.target_angle_rad - axis.motor.angle_rad;
-        if axis.angle_error_rad > core::f32::consts::PI {
-            axis.angle_error_rad -= core::f32::consts::TAU;
-        } else if axis.angle_error_rad < -core::f32::consts::PI {
-            axis.angle_error_rad += core::f32::consts::TAU;
-        }
-        let measured_angle = axis.target_angle_rad - axis.angle_error_rad;
+        axis.angle_error_rad = axis.target_angle_rad - axis.motor.continuous_angle_rad;
         axis.target_rpm = axis
             .position_pid
-            .calculate(axis.target_angle_rad, measured_angle)?;
+            .calculate(axis.target_angle_rad, axis.motor.continuous_angle_rad)?;
         Self::update_speed_control(axis)?;
         Ok(())
     }
@@ -483,7 +498,7 @@ impl Control {
         }
     }
 
-    /// 根据左摇杆积分更新角度目标，再通过位置环和速度环计算输出。
+    /// 左摇杆改变两轴的位置目标；位置环生成速度目标，再由速度环生成电压指令。
     pub fn update_running_mode(&mut self, now: Instant, entered: bool) {
         if !Self::feedback_fresh(self.yaw_feedback_time, now, NORMAL_FEEDBACK_TIMEOUT)
             || !Self::feedback_fresh(self.pitch_feedback_time, now, NORMAL_FEEDBACK_TIMEOUT)
@@ -493,9 +508,9 @@ impl Control {
         }
 
         if entered {
-            self.yaw.target_angle_rad = self.yaw.motor.angle_rad;
+            self.yaw.target_angle_rad = self.yaw.motor.continuous_angle_rad;
             self.pitch.target_angle_rad =
-                Self::limit_pitch_target_angle(self.pitch.motor.angle_rad);
+                Self::limit_pitch_target_angle(self.pitch.motor.continuous_angle_rad);
             self.yaw.position_pid.reset();
             self.yaw.speed_pid.reset();
             self.pitch.position_pid.reset();
@@ -511,22 +526,20 @@ impl Control {
             let yaw_input = Self::apply_stick_deadzone(yaw_channel as f32 / 660.0);
             let pitch_input = Self::apply_stick_deadzone(remote.channels[3] as f32 / 660.0);
             self.yaw.target_angle_rad += yaw_input * YAW_MAX_TARGET_RATE_RAD_S * CONTROL_PERIOD_S;
-            if self.yaw.target_angle_rad >= core::f32::consts::TAU {
-                self.yaw.target_angle_rad -= core::f32::consts::TAU;
-            } else if self.yaw.target_angle_rad < 0.0 {
-                self.yaw.target_angle_rad += core::f32::consts::TAU;
-            }
             self.pitch.target_angle_rad = Self::limit_pitch_target_angle(
                 self.pitch.target_angle_rad
                     + pitch_input * PITCH_MAX_TARGET_RATE_RAD_S * CONTROL_PERIOD_S,
             );
         }
 
-        if Self::update_axis_control(&mut self.yaw).is_err()
-            || Self::update_axis_control(&mut self.pitch).is_err()
-        {
+        if Self::update_axis_control(&mut self.yaw).is_err() {
             self.fail(Fault::InvalidControl);
-            rtt_target::rprintln!("Fault: invalid PID calculation in Running");
+            rtt_target::rprintln!("Fault: invalid yaw PID calculation in Running");
+            return;
+        }
+        if Self::update_axis_control(&mut self.pitch).is_err() {
+            self.fail(Fault::InvalidControl);
+            rtt_target::rprintln!("Fault: invalid pitch PID calculation in Running");
             return;
         }
         self.check_motion_faults(now, RUNNING_OUTPUT_ENABLED);
@@ -535,8 +548,10 @@ impl Control {
     // 回正到两个电机的原始单圈角度零位。
     pub fn update_prepare_mode(&mut self, now: Instant, entered: bool) {
         if entered {
-            self.yaw.target_angle_rad = YAW_CALIB_ANGLE_RAD;
-            self.pitch.target_angle_rad = PITCH_CALIB_ANGLE_RAD;
+            self.yaw.target_angle_rad = self.yaw.motor.continuous_angle_rad
+                + single_turn_angle_delta(YAW_CALIB_ANGLE_RAD - self.yaw.motor.angle_rad);
+            self.pitch.target_angle_rad = self.pitch.motor.continuous_angle_rad
+                + single_turn_angle_delta(PITCH_CALIB_ANGLE_RAD - self.pitch.motor.angle_rad);
             self.yaw.position_pid.reset();
             self.yaw.speed_pid.reset();
             self.pitch.position_pid.reset();
@@ -783,13 +798,15 @@ async fn control_task(
         watch_mut!("pitch.speed.kd": f32 = &mut control.pitch.speed_pid.kd);
         control.tick(&mut can);
         watch!("yaw.angle.target": f32 = control.yaw.target_angle_rad, unit = "rad");
-        watch!("yaw.angle.measured": f32 = control.yaw.motor.angle_rad, unit = "rad");
+        watch!("yaw.angle.measured": f32 = control.yaw.motor.continuous_angle_rad, unit = "rad");
         watch!("yaw.angle.error": f32 = control.yaw.angle_error_rad, unit = "rad");
+        watch!("yaw.angle.encoder_single_turn": f32 = control.yaw.motor.angle_rad, unit = "rad");
         watch!("yaw.speed.target": f32 = control.yaw.target_rpm, unit = "rpm");
         watch!("yaw.speed.measured": f32 = control.yaw.motor.speed_rpm, unit = "rpm");
         watch!("yaw.voltage.command": f32 = control.yaw.motor.command_voltage);
         watch!("pitch.angle.target": f32 = control.pitch.target_angle_rad, unit = "rad");
-        watch!("pitch.angle.measured": f32 = control.pitch.motor.angle_rad, unit = "rad");
+        watch!("pitch.angle.measured": f32 = control.pitch.motor.continuous_angle_rad, unit = "rad");
+        watch!("pitch.angle.encoder_single_turn": f32 = control.pitch.motor.angle_rad, unit = "rad");
         watch!("pitch.angle.error": f32 = control.pitch.angle_error_rad, unit = "rad");
         watch!("pitch.speed.target": f32 = control.pitch.target_rpm, unit = "rpm");
         watch!("pitch.speed.measured": f32 = control.pitch.motor.speed_rpm, unit = "rpm");
@@ -800,11 +817,12 @@ async fn control_task(
         {
             last_remote_debug = now;
             rtt_target::rprintln!(
-                "Status: state={:?}, fault={:?}, yaw_age={:?}, yaw_angle={}, yaw_error={}, yaw_rpm={}, yaw_target={}, yaw_voltage={}, tx_failed={}, invalid_feedback={}, can_errors={}, armed={}",
+                "Status: state={:?}, fault={:?}, yaw_age={:?}, yaw_angle={}, yaw_target_angle={}, yaw_error={}, yaw_rpm={}, yaw_target_rpm={}, yaw_voltage={}, tx_failed={}, invalid_feedback={}, can_errors={}, armed={}",
                 control.state,
                 control.fault,
                 control.yaw_feedback_age,
-                control.yaw.motor.angle_rad,
+                control.yaw.motor.continuous_angle_rad,
+                control.yaw.target_angle_rad,
                 control.yaw.angle_error_rad,
                 control.yaw.motor.speed_rpm,
                 control.yaw.target_rpm,
@@ -815,9 +833,10 @@ async fn control_task(
                 control.armed,
             );
             rtt_target::rprintln!(
-                "Status: axis=pitch, pitch_age={:?}, pitch_angle={}, pitch_error={}, pitch_rpm={}, pitch_target={}, pitch_voltage={}, tx_failed={}, invalid_feedback={}, can_errors={}, armed={}",
+                "Status: axis=pitch, pitch_age={:?}, pitch_angle={}, pitch_target_angle={}, pitch_error={}, pitch_rpm={}, pitch_target_rpm={}, pitch_voltage={}, tx_failed={}, invalid_feedback={}, can_errors={}, armed={}",
                 control.pitch_feedback_age,
-                control.pitch.motor.angle_rad,
+                control.pitch.motor.continuous_angle_rad,
+                control.pitch.target_angle_rad,
                 control.pitch.angle_error_rad,
                 control.pitch.motor.speed_rpm,
                 control.pitch.target_rpm,
